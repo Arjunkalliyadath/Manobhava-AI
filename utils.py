@@ -1,3 +1,34 @@
+"""
+Module Name
+-----------
+utils.py
+
+Purpose
+-------
+Small, dependency-free text-cleaning helpers shared by every scraper and
+by the merge/dedup step in app.py, ahead of sentiment analysis.
+
+Responsibilities
+-----------------
+- `clean_comment`: strip boilerplate/noise characters from a raw scraped
+  comment.
+- `normalize_text`: collapse whitespace for consistent downstream
+  comparison and display.
+- `remove_links`: strip URLs out of comment text before sentiment
+  analysis and dedup, so a shared link doesn't affect either.
+- `unique_comments`: order-preserving de-duplication of (platform, text)
+  pairs, used when merging comments collected across all six sources.
+
+Inputs / Outputs
+-----------------
+All four functions take and return plain strings or lists of strings —
+no external objects, no I/O.
+
+Dependencies
+------------
+Standard library only: `re`, `typing`.
+"""
+
 import re
 from typing import List, Tuple
 

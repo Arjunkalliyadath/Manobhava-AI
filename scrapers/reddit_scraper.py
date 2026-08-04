@@ -37,10 +37,18 @@ company-wide job, which has no product_name - see _build_search_tiers):
      isn't already part of the product name)
   3. Company + Product          e.g. "Headphone Zone Tangzu Wan'er"
 
-A tier is only treated as "successful" - stopping the search - once its
-candidate posts have actually been visited and yielded at least one usable
-comment, not merely once a search returns candidate posts. This mirrors
-the tier-fallback logic in youtube_scraper.py.
+A tier only counts as having "returned something" once its candidate posts
+have actually been visited and yielded at least one usable comment, not
+merely once a search returns candidate posts. Unlike a simple first-
+success-wins fallback, tiers ACCUMULATE: a tier that only turns up a thin
+result doesn't stop the search - broader, lower-priority tiers still run
+and their comments are added on top, until either a healthy total is
+reached (_MIN_COMMENTS_BEFORE_STOPPING) or the hard cap (MAX_TOTAL_COMMENTS,
+from config.py's MAX_REDDIT_COMMENTS) is hit. This is deliberately
+different from youtube_scraper.py's tier-fallback, which does stop at the
+first tier that succeeds - Reddit's tiers are cheap plain-HTTP requests, so
+the trade-off of trying one more tier for more genuine volume is worth it
+here in a way it may not be for a heavier per-tier cost elsewhere.
 ----------------------------------------------------------------------------
 
 Discussion-post filtering ("ignore News / Advertisements / Image posts /
@@ -69,6 +77,7 @@ from urllib.parse import urlencode
 
 from bs4 import BeautifulSoup
 
+from config import MAX_REDDIT_COMMENTS
 from scrapers.browser_utils import normalize_comments
 
 logger = logging.getLogger(__name__)
@@ -87,18 +96,52 @@ _EXECUTOR = concurrent.futures.ThreadPoolExecutor(
 )
 
 # --- Hard internal time budget -----------------------------------------
-# Kept a few seconds under the outer asyncio.wait_for() cap applied per job
-# in app.py (20s - see REDDIT_TIMEOUT_SECONDS there) so this scraper almost
-# always returns on its own, with whatever it has collected so far, instead
-# of being cut off cold by the outer timeout and losing partial results.
-TIME_BUDGET_SECONDS = 16
+# Kept well under the outer asyncio.wait_for() cap applied per job in
+# app.py (50s - see REDDIT_TIMEOUT_SECONDS there) so this scraper almost
+# always returns on its own, with whatever it has collected so far,
+# instead of being cut off cold by the outer timeout and losing partial
+# results that already finished.
+# Raised 18 -> 80 (was previously raised 16 -> 18, leaving only 2s of
+# margin under the old 20s outer cap): that margin was sized for the
+# original MAX_TOTAL_COMMENTS=60/single-tier behavior and was never
+# rescaled when tier-accumulation + MAX_REDDIT_COMMENTS=200 landed.
+# Production logs showed real runs completing at 22.8s - already past
+# both the old 18s internal budget AND the old 20s outer cap - because
+# individual HTTP round-trips plus _REQUEST_DELAY_SECONDS pauses across
+# up to 3 accumulating tiers don't fit a 2s margin. This is deliberately
+# much smaller than youtube_scraper.py's equivalent (600s) since this is
+# plain HTTP, not browser automation - it doesn't need anywhere near that
+# much time, just enough real slack that the internal deadline checks
+# between requests (not mid-request) can't slip past the outer cap.
+TIME_BUDGET_SECONDS = 40  # cut from 80 - priority shifted to 3-min total time; this is a safety ceiling on scrape time, not a target - MAX_REDDIT_COMMENTS (config.py, currently 70) is the actual comment-count cap.
 _MIN_TIME_FOR_ANOTHER_TIER_SECONDS = 3
 
 # --- Volume / politeness caps -------------------------------------------
-MAX_CANDIDATE_POSTS_PER_TIER = 6   # discussion posts inspected per search tier
-MAX_COMMENTS_PER_POST = 15         # top-level comments kept from any one post
-MAX_TOTAL_COMMENTS = 60            # overall cap per scrape_reddit_comments() call
+MAX_CANDIDATE_POSTS_PER_TIER = 10  # raised from 6 - search already asks Reddit
+# for up to 25 results per query (see the `limit: 25` search param below) but
+# was only ever inspecting the top 6 by comment count; 10 lets more real
+# discussion threads contribute without a large increase in request volume.
+MAX_COMMENTS_PER_POST = 40         # raised from 15 - this costs NO extra HTTP
+# requests to raise: _fetch_post_comments[_html] already downloads a post's
+# full comment payload in one request regardless of how many comments are
+# kept from it, so throwing away comments past 15 was pure lost yield from
+# data already paid for. Big, popular threads can now actually contribute
+# close to their real comment count instead of being clipped hard.
+MAX_TOTAL_COMMENTS = MAX_REDDIT_COMMENTS  # was a hardcoded local 60; now reads
+# config.py like every other platform's cap does (see config.py's comment on
+# MAX_REDDIT_COMMENTS for why 60 was never realistically going to hit the
+# 100-200-per-product target on its own).
 _REQUEST_DELAY_SECONDS = 0.4       # brief pause between successive Reddit requests
+
+# Once accumulated comments (across however many tiers have run so far) reach
+# this many, stop trying further/broader search tiers even if MAX_TOTAL_COMMENTS
+# hasn't been hit yet - there's a real yield/relevance trade-off in continuing
+# past a genuinely healthy result just to reach the hard cap, since tiers 2/3
+# are intentionally broader (brand+product, company+product) and thus more
+# likely to surface tangential discussion. This only controls how EAGERLY the
+# loop below keeps going past a "good enough" tier - see the tier-accumulation
+# fix in _scrape_sync.
+_MIN_COMMENTS_BEFORE_STOPPING = 40
 
 # Reddit asks even anonymous/unauthenticated clients to identify themselves
 # with a descriptive User-Agent; generic ones are the fastest way to get
@@ -196,7 +239,20 @@ def _is_discussion_post(post: Dict) -> bool:
 _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((?:[^)]+)\)")
 _URL_RE = re.compile(r"https?://\S+")
 _MD_EMPHASIS_RE = re.compile(r"[*_~`^]+")
-_QUOTE_MARKER_RE = re.compile(r"^\s*>+\s?", re.MULTILINE)
+# FIX: this used to be r"^\s*>+\s?" applied with .sub("", text) - which only
+# strips the leading '>' marker character(s) from a quoted line, leaving the
+# quoted line's actual CONTENT in place, merged in with whatever the replier
+# wrote below it. On Reddit, replying by quoting ("> original comment" then
+# your own response underneath) is a very common pattern - the old behavior
+# meant the quoted person's words silently became indistinguishable from the
+# replying commenter's own text by the time this reaches sentiment analysis
+# (e.g. someone quoting a complaint just to disagree with it would have that
+# complaint folded into their own "clean" comment as if they'd said it).
+# Now matches and removes the WHOLE line (through its trailing newline, or
+# to end-of-string for a final line with none), for every line whose first
+# non-whitespace character is '>' - confirmed via test against multi-line
+# input that this drops the quoted line entirely rather than just its marker.
+_QUOTE_LINE_RE = re.compile(r"^[ \t]*>.*(?:\n|$)", re.MULTILINE)
 _WHITESPACE_RE = re.compile(r"\s+")
 
 _EXCLUDED_AUTHORS = {"automoderator", "[deleted]"}
@@ -210,10 +266,10 @@ def _clean_reddit_markdown(text: str) -> str:
     every platform's comments in app.py, so this stays scoped to syntax
     that's specific to Reddit's comment markdown."""
     text = html.unescape(text)
+    text = _QUOTE_LINE_RE.sub("", text)
     text = _MD_LINK_RE.sub(r"\1", text)
     text = _URL_RE.sub("", text)
     text = _MD_EMPHASIS_RE.sub("", text)
-    text = _QUOTE_MARKER_RE.sub("", text)
     text = _WHITESPACE_RE.sub(" ", text).strip()
     return text
 
@@ -399,6 +455,24 @@ def _search_reddit_html(query: str, time_left: float) -> List[Dict]:
     try:
         soup = BeautifulSoup(html_text, "html.parser")
         for div in soup.select("div.search-result-link"):
+            # ADDED (best-effort, unverified against a live page - see note
+            # below): _is_discussion_post() already excludes over_18 posts
+            # on the JSON path, but that path 403s on every request seen so
+            # far (see _BROWSER_HEADERS above), so this HTML path is what
+            # actually runs on every live scrape right now, and it had no
+            # NSFW check at all. old.reddit.com's templates mark NSFW
+            # content with an "over18" class token elsewhere on the site
+            # (subreddit/listing pages); I'm assuming the same token appears
+            # on this result div when applicable, but I have no network
+            # access in this environment to fetch a real search-results page
+            # and confirm that's actually how *this* template marks it. This
+            # can only ever exclude a post, never wrongly include one, so
+            # it's safe to ship unverified - please check the next log for
+            # whether NSFW/18+ content still slips through; if it does, the
+            # class/attribute name below needs correcting against real HTML.
+            classes = div.get("class") or []
+            if "over18" in classes:
+                continue
             fullname = div.get("data-fullname") or ""  # "t3_<id>"
             post_id = fullname.split("_", 1)[1] if fullname.startswith("t3_") else ""
             title_a = div.select_one("a.search-title")
@@ -535,15 +609,33 @@ def _scrape_sync(company_name: str, product_name: str, product_brand: str) -> Li
     # Used to prevent duplicate comments
     seen_keys: set = set()
 
-    # Tracks which search tier successfully returned comments
-    source = "none"
+    # Tracks which search tier(s) contributed comments, in order
+    sources_used: List[str] = []
 
-    # Try each search tier until comments are found or time runs out
+    # Try each search tier, ACCUMULATING across tiers (not stopping at the
+    # first one that returns anything) until either a healthy yield is
+    # reached, the hard cap is hit, or time/tiers run out.
+    #
+    # FIX: this used to `break` as soon as any single tier returned even one
+    # usable comment - so a specific product name (Priority 1) that only
+    # matched one small thread with a handful of comments would stop the
+    # entire scrape right there, never trying the intentionally broader
+    # Priority 2 (brand+product) / Priority 3 (company+product) tiers that
+    # might have surfaced additional real discussion. That was the single
+    # biggest reason real per-product counts were landing well under the
+    # 100-200 target even when more genuine discussion existed. Now a tier
+    # is only treated as "we have enough" once accumulated comments reach
+    # _MIN_COMMENTS_BEFORE_STOPPING - a thin result keeps the search going
+    # to the next, broader tier instead of ending it.
     for label, query in tiers:
 
-        # Stop trying new search queries if there isn't enough time left
+        # Stop trying new search queries if there isn't enough time left,
+        # or if a previous tier already reached the hard cap.
         if time_left() <= _MIN_TIME_FOR_ANOTHER_TIER_SECONDS:
             logger.info("Reddit scrape: skipping tier %r - out of time budget.", label)
+            break
+        if len(collected) >= MAX_TOTAL_COMMENTS:
+            logger.info("Reddit scrape: skipping tier %r - already at the comment cap.", label)
             break
 
         # Search Reddit for posts matching the current query
@@ -611,22 +703,42 @@ def _scrape_sync(company_name: str, product_name: str, product_brand: str) -> Li
             if len(collected) + len(tier_comments) >= MAX_TOTAL_COMMENTS:
                 break
 
-        # If this search tier returned comments, stop trying lower-priority tiers
         if tier_comments:
             collected.extend(tier_comments)
-            source = label
+            sources_used.append(label)
 
             logger.info(
-                "Reddit scrape: tier %r succeeded with %d comment(s).",
+                "Reddit scrape: tier %r contributed %d comment(s) (running total=%d).",
                 label,
                 len(tier_comments),
+                len(collected),
             )
-            break
+
+            # "Enough" now means a healthy accumulated total, not merely
+            # "a tier returned something" - only stop here if we've reached
+            # that bar or the hard cap; otherwise fall through to the next,
+            # broader tier for more.
+            if len(collected) >= _MIN_COMMENTS_BEFORE_STOPPING or len(collected) >= MAX_TOTAL_COMMENTS:
+                logger.info(
+                    "Reddit scrape: reached %d comment(s) after tier %r - "
+                    "that's enough, not trying further tiers.",
+                    len(collected), label,
+                )
+                break
+
+            logger.info(
+                "Reddit scrape: only %d comment(s) so far after tier %r - "
+                "still trying broader tiers for more.",
+                len(collected), label,
+            )
+            continue
 
         logger.info(
             "Reddit scrape: tier %r yielded posts but 0 usable comments; trying next tier.",
             label,
         )
+
+    source = "+".join(sources_used) if sources_used else "none"
 
     # Calculate the total scraping time
     elapsed = time.monotonic() - start

@@ -10,5 +10,4 @@ transformers==4.45.0
 torch==2.5.0
 python-multipart==0.0.20
 aiofiles==24.1.0
-requests==2.6.0
-openpyxl==3.1.5
+reportlab==4.2.5

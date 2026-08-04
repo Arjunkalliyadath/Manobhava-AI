@@ -1,3 +1,52 @@
+"""
+Module Name
+-----------
+config.py
+
+Purpose
+-------
+Single source of truth for every tunable limit and threshold used across
+the pipeline: how many products/comments to collect per platform, how long
+to wait on slow navigations, and the keyword/scoring tables Product
+Discovery uses to rank and filter candidate products.
+
+Responsibilities
+----------------
+- Hold per-platform comment/review volume caps (MAX_GOOGLE_REVIEWS,
+  MAX_YOUTUBE_COMMENTS, MAX_REDDIT_COMMENTS, MAX_INSTAGRAM_COMMENTS,
+  MAX_TWITTER_POSTS) and the product-selection ceiling
+  (MAX_SELECTABLE_PRODUCTS) — the values that most directly trade comment
+  volume against the 1-3 minute total execution time budget.
+- Hold navigation/retry tuning (NAV_TIMEOUT_MS and its MIN/MAX adaptive
+  bounds, NAVIGATION_RETRIES, MAX_SCROLL_ITERATIONS, SCROLL_IDLE_LIMIT)
+  used by every Playwright-based scraper.
+- Hold Product Discovery's text-filtering tables (BLACKLIST_WORDS,
+  PROMINENCE_TIERS, EXACT_BADGE_TERMS, FEATURE_KEYWORDS) and candidate
+  length bounds (MIN_CANDIDATE_LEN / MAX_CANDIDATE_LEN).
+- Hold GOOGLE_REVIEW_CACHE_TTL_SECONDS, the TTL for caching business-level
+  Google reviews across products in one analysis run (Google reviews are
+  per-business, not per-product, so this avoids re-scraping Maps once per
+  selected product).
+
+On the inline comments in this file
+------------------------------------
+Several constants below carry comments citing a specific date, a live-run
+measurement, or a person's own stated priority. These are load-bearing
+history, not clutter: most of the volume caps here were deliberately cut
+from earlier, larger values specifically to fit the 3-minute execution
+budget, and the comments record the evidence that drove each cut (e.g. a
+live log showing Sentiment Analysis alone taking 110s of a 188.56s run).
+Re-raising a cap without accounting for that evidence risks reintroducing
+the exact timing problem it was cut to fix — see sentiment.py and
+ARCHITECTURE.md for the fuller picture.
+
+Dependencies
+------------
+Standard library only: `typing.List` (for the keyword/tier table type
+hints). No I/O, no imports from elsewhere in this project — every other
+module imports FROM this one, never the other way around.
+"""
+
 from typing import List
 
 # Number of products returned by Product Discovery.
@@ -5,6 +54,7 @@ from typing import List
 # to choose from the COMPLETE catalogue.
 
 MAX_PRODUCTS: int = 500
+MAX_SELECTABLE_PRODUCTS: int = 3  # how many products the person can pick for one analysis run (was 5) - each one multiplies scraper work across every platform, so this is the main lever keeping even the "extreme case" under the 3-minute ceiling. Enforced in both the frontend (templates/select_products.html) and the backend (app.py, both /analyze and /analyze_selected) so it holds even for requests that bypass the UI.
 
 MAX_PARALLEL_TASKS: int = 5
 
@@ -25,10 +75,21 @@ MAX_COMMENTS_PER_PRODUCT: int = 20
 # scroll-idle detection below, so it will return early (with whatever
 # partial results it has) if the platform simply has fewer items, if
 # nothing new is loading anymore, or if time runs out.
-MAX_GOOGLE_REVIEWS: int = 200
-MAX_YOUTUBE_COMMENTS: int = 200
+MAX_GOOGLE_REVIEWS: int = 30  # cut from 200 - priority shifted to 3-min total time; genuine over volume
+MAX_YOUTUBE_COMMENTS: int = 70  # cut again from 100 - see the note this replaces for the 200->100 cut and its reasoning. Live log with 100/product still showed Sentiment Analysis alone taking 110s for 742 total comments (58.5% of a 188.56s run) once genuine per-product data was actually flowing in. Combined with GENERAL_YOUTUBE_TIMEOUT_SECONDS (app.py) giving the brand-wide "General" job a much shorter budget than product-specific jobs, this is aimed squarely at the person's own framing: "no need of 300+ ... minimum of 100 genuine comments ... depending on time taking" - time is the overriding constraint when it conflicts with volume.
 MAX_TWITTER_POSTS: int = 100
-MAX_INSTAGRAM_COMMENTS: int = 100
+MAX_INSTAGRAM_COMMENTS: int = 25  # cut from 100 - priority shifted to 3-min total time; genuine over volume
+
+# Added - reddit_scraper.py previously hardcoded its own MAX_TOTAL_COMMENTS = 60
+# locally instead of reading a config.py cap like every other platform does,
+# which is well under the 100-200-per-product target. Raised well past that
+# target for the same reason MAX_YOUTUBE_COMMENTS was: the real ceiling for
+# Reddit is how many relevant discussion threads/comments actually exist and
+# how much of the scraper's own internal TIME_BUDGET_SECONDS is left, not this
+# number - see reddit_scraper.py's _scrape_sync for the matching tier-
+# accumulation fix (it used to stop at the first search tier that returned
+# ANY comment at all, even a thin one, instead of trying broader tiers too).
+MAX_REDDIT_COMMENTS: int = 70  # cut again from 100, same live-log evidence and reasoning as MAX_YOUTUBE_COMMENTS just above.
 
 # ---------------------------------------------------------------------------
 # Scroll / navigation tuning shared by all scrapers.
@@ -42,7 +103,7 @@ MAX_INSTAGRAM_COMMENTS: int = 100
 #   navigation (timeout, transient network error) before giving up on that
 #   URL and moving on / falling back.
 MAX_SCROLL_ITERATIONS: int = 100
-SCROLL_IDLE_LIMIT: int = 5
+SCROLL_IDLE_LIMIT: int = 9
 
 # Reduced from 3 -> 1. A blocked/dead site (login wall, bot-check,
 # rate-limit) essentially never recovers on retry #2/#3 - it just burns

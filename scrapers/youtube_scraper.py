@@ -1,8 +1,50 @@
+"""
+Module Name
+-----------
+scrapers/youtube_scraper.py
+
+Purpose
+-------
+Collects genuine, product-specific comments from YouTube: comments left
+on videos that actually discuss the selected product, prioritizing the
+company's own official channel and review-style videos over unrelated
+brand-wide content.
+
+Responsibilities
+-----------------
+- `scrape_youtube_comments(company_data)`: the single public entry point.
+  Runs a set of product-centric discovery tiers (a company-wide "General"
+  search plus one per selected product), ranks candidate videos, then
+  visits enough of them to reach the configured comment target
+  (`config.MAX_YOUTUBE_COMMENTS`) while removing duplicates.
+- Gives the brand-wide "General" job a shorter time budget than
+  product-specific jobs (see `GENERAL_YOUTUBE_TIMEOUT_SECONDS` in
+  app.py / the per-job timeout logic here) since it is lower priority
+  than a genuine per-product result.
+- Attaches to the shared Chromium process via `scrapers.browser_utils`
+  rather than launching its own, and logs `BROWSER_TRACE` timing at each
+  setup checkpoint, same as google_scraper.py / twitter_scraper.py /
+  instagram_scraper.py.
+- Enforces one real wall-clock deadline anchored to the moment
+  `scrape_youtube_comments()` itself starts (`OUTER_HARD_TIMEOUT_SECONDS`
+  / `SAFETY_MARGIN_SECONDS`), so a slow setup phase can never silently eat
+  into the time a caller expects the result back within — see the
+  in-file comment on `OUTER_HARD_TIMEOUT_SECONDS` for the specific
+  production incident (real comments collected, discarded because the
+  coroutine had already been cancelled) that this fixed.
+
+Dependencies
+------------
+`playwright` (sync API), `httpx`, plus standard library `asyncio`, `json`,
+`re`, `threading`, `time`.
+"""
+
 import asyncio
 import atexit
 import concurrent.futures
 import json
 import logging
+import math
 import re
 import sys
 import threading
@@ -13,13 +55,12 @@ from urllib.parse import quote_plus
 
 import httpx
 
-from scrapers.browser_utils import browser_launch_slot, normalize_comments, find_social_profile_url
+from scrapers.browser_utils import browser_manager, normalize_comments, find_social_profile_url
 from config import (
     MAX_YOUTUBE_COMMENTS,
     MAX_SCROLL_ITERATIONS,
     SCROLL_IDLE_LIMIT,
     NAVIGATION_RETRIES,
-    NAV_TIMEOUT_MS,
     NAV_TIMEOUT_MS_MAX,
     NAV_TIMEOUT_MS_MIN,
 )
@@ -27,19 +68,61 @@ from config import (
 logger = logging.getLogger(__name__)
 
 # --- Hard internal time budget -----------------------------------------
+# PREVIOUS BUG (same class of bug already fixed in twitter_scraper.py and
+# instagram_scraper.py - see twitter_scraper.py's OUTER_HARD_TIMEOUT_SECONDS
+# block for the full writeup): `deadline = start + TIME_BUDGET_SECONDS`
+# below used to start a FRESH clock only after browser/context/page setup
+# had already finished, with no memory of how much of the OUTER app.py
+# wait_for() budget setup itself had already spent. Setup was regularly
+# taking 22-46s+ under this app's shared-Chromium contention at the start
+# of an analysis run (up to 3 YouTube jobs - "General" plus one per
+# selected product - all launching their own Playwright driver at once,
+# alongside Google/Twitter/Instagram doing the same - see BROWSER_TRACE
+# logs), so "setup + a fresh TIME_BUDGET_SECONDS" routinely exceeded
+# app.py's real 30s YOUTUBE_TIMEOUT_SECONDS cap. Production logs show
+# exactly this: app.py logged "YouTube Scraper job for 'boAt Rockerz 255
+# Pro+' exceeded its 30s hard timeout — returning []" (i.e. app.py's
+# outer wait_for() already gave up and used [] as the result) while the
+# *actual* _run_sync() kept executing unseen on its executor thread and
+# later logged "YouTube comments for 'boAt Lifestyle' (product='boAt
+# Rockerz 255 Pro+' ...): final=59" - 59 real comments, correctly
+# collected, that never reached the dashboard because the coroutine that
+# would have returned them had already been cancelled.
+#
+# Fixed the same way as the other two scrapers: one real wall-clock
+# deadline anchored to the moment scrape_youtube_comments() itself starts
+# (before the channel/handle resolution fallback), via
+# OUTER_HARD_TIMEOUT_SECONDS / SAFETY_MARGIN_SECONDS, passed down into
+# _run_sync() as `_overall_start` so it always leaves real margin for the
+# result to make it back through run_in_executor()/wait_for(), no matter
+# how long setup took. TIME_BUDGET_SECONDS is kept only as the
+# "no contention at all" reference value the comments below still
+# describe; deadline/time_left() (see _run_sync()) are what the code
+# actually uses now.
+OUTER_HARD_TIMEOUT_SECONDS = 90  # cut from 600 - priority shifted to 3-min total time. With MAX_YOUTUBE_COMMENTS now 70 (was 30 when this comment was first written), this should rarely be hit; kept as a safety ceiling, not a target.
+# only ever enough time to visit ONE candidate video per product before the outer
+# deadline hit - nowhere near enough to reach hundreds/thousands of comments across
+# many videos. Getting real volume requires real wall-clock time; there's no way
+# around that while scraping respectfully. Must be kept in sync with app.py's
+# YOUTUBE_TIMEOUT_SECONDS (both call sites).
+SAFETY_MARGIN_SECONDS = 20.0  # scaled up from 8.0 alongside the larger outer budget
+MIN_USEFUL_BUDGET_SECONDS = 6.0  # below this, don't even attempt navigation
+
 # Kept a few seconds under the outer asyncio.wait_for() cap applied in
-# app.py (30s, widened from 20s - the old value was below observed
-# setup_time (~7.7-7.8s) + this budget (17s), so the outer timeout fired
-# before this scraper's own tier-fallback logic ever finished) so this
-# scraper almost always returns on its own, with whatever it has
-# collected so far, instead of being cut off cold by the outer timeout
-# and losing partial results. NOTE: this budget is shared
-# across all 3 product-centric search tiers (see "Product-centric
+# app.py (100s as of this fix - YOUTUBE_TIMEOUT_SECONDS there, kept in
+# sync with OUTER_HARD_TIMEOUT_SECONDS=90 above plus buffer) so this
+# scraper almost always returns on its own,
+# with whatever it has collected so far, instead of being cut off cold by
+# the outer timeout and losing partial results. NOTE: this budget is
+# shared across all 3 product-centric search tiers (see "Product-centric
 # discovery tiers" below) — a run that falls through 1-2 dead tiers has
 # meaningfully less time left for the tier that finally succeeds than a
 # single-tier flow would. Revisit this value if logs show later tiers
 # frequently being skipped due to time (`_MIN_TIME_FOR_ANOTHER_TIER_SECONDS`
-# below) even on runs that started with a full budget.
+# below) even on runs that started with a full budget. NOTE: this constant
+# itself is no longer what enforces the real deadline (see the
+# OUTER_HARD_TIMEOUT_SECONDS block above) — it's kept only as the
+# "no contention at all" reference value these comments describe.
 TIME_BUDGET_SECONDS = 17
 
 # How many candidate video URLs to gather from the channel/search page
@@ -47,7 +130,7 @@ TIME_BUDGET_SECONDS = 17
 # each one for comments is the expensive part, so we keep some candidates
 # in reserve in case early videos have comments disabled or turn out to
 # have little content.
-VIDEO_CANDIDATES_TO_COLLECT = 15
+VIDEO_CANDIDATES_TO_COLLECT = 50
 
 # Overall cap on how many comments this scraper will try to collect across
 # all videos for one company/channel, sourced from config so it can be
@@ -175,9 +258,30 @@ MAX_BROWSER_WORKERS = 3
 MAX_USES_BEFORE_RECYCLE = 50
 
 _thread_local = threading.local()
+_browser_trace = threading.local()
 _EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=MAX_BROWSER_WORKERS, thread_name_prefix="youtube_scraper"
 )
+
+# --- Company-wide channel-resolution cache ----------------------------------
+# scrape_youtube_comments() is invoked once per job in a job group - one
+# "General" job plus one per selected product (see ARCHITECTURE.md §2/§3).
+# The find_social_profile_url() search fallback below is entirely
+# company-wide - it never depends on product_name - so every job in the same
+# group resolves the exact same channel independently. Confirmed live
+# (2026-07-30 Samsung India run, 3 concurrent jobs): the identical
+# DuckDuckGo query ("site:youtube.com \"Samsung India\"") fired 3 times in
+# the log, wasting 2 of the 3 network round trips on a miss - the same
+# CPU/network contention concern as ARCHITECTURE.md §8, just on the network
+# side instead of Playwright. This cache makes the search happen once per
+# company per process lifetime; every other concurrent (or later) job for
+# the same company reuses the result - hit or confirmed-miss - instead of
+# re-querying. Safe to share across products (unlike comment content itself,
+# which must stay per-product - see ARCHITECTURE.md §7): a channel handle is
+# a property of the company, not of any one product.
+_channel_resolution_lock = threading.Lock()
+_channel_resolution_cache: Dict[str, str] = {}
+_channel_resolution_events: Dict[str, threading.Event] = {}
 
 
 class _BrowserHandle:
@@ -305,6 +409,8 @@ atexit.register(_shutdown_all_workers)
 def _ensure_context():
     """Get (creating or recycling as needed) this thread's browser context."""
     handle = _get_handle()
+    browser_trace_started_at = time.monotonic()
+    _browser_trace.ensure_context_started_at = browser_trace_started_at
     ctx = handle.context
 
     if ctx is not None:
@@ -332,11 +438,38 @@ def _ensure_context():
 
     pw = handle.playwright
     if pw is None:
+        logger.info(
+            "BROWSER_TRACE scraper=YouTube event=before_sync_playwright_start elapsed=%.3fs timestamp=%.3f thread=%s",
+            time.monotonic() - browser_trace_started_at, time.time(), threading.current_thread().name,
+        )
         pw = sync_playwright().start()
+        logger.info(
+            "BROWSER_TRACE scraper=YouTube event=after_sync_playwright_start elapsed=%.3fs timestamp=%.3f thread=%s",
+            time.monotonic() - browser_trace_started_at, time.time(), threading.current_thread().name,
+        )
         handle.playwright = pw
 
-    with browser_launch_slot():
-        browser = pw.chromium.launch(headless=True, args=_LAUNCH_ARGS)
+    logger.info(
+        "BROWSER_TRACE scraper=YouTube event=before_shared_browser_attach elapsed=%.3fs timestamp=%.3f thread=%s",
+        time.monotonic() - browser_trace_started_at, time.time(), threading.current_thread().name,
+    )
+    # Attach to the ONE application-wide Chromium process instead of
+    # launching a new one. ensure_shared_browser() only actually launches
+    # Chromium on the very first call anywhere in the process; every call
+    # after that - including this one, almost always - just returns the
+    # existing CDP endpoint immediately. This (not a per-call launch slot)
+    # is what removes the 44-46s startup stall: see browser_utils.py's
+    # BrowserManager.ensure_shared_browser() docstring for the mechanics.
+    cdp_endpoint = browser_manager.ensure_shared_browser()
+    browser = pw.chromium.connect_over_cdp(cdp_endpoint)
+    logger.info(
+        "BROWSER_TRACE scraper=YouTube event=after_shared_browser_attach elapsed=%.3fs timestamp=%.3f thread=%s",
+        time.monotonic() - browser_trace_started_at, time.time(), threading.current_thread().name,
+    )
+    logger.info(
+        "BROWSER_TRACE scraper=YouTube event=before_new_context elapsed=%.3fs timestamp=%.3f thread=%s",
+        time.monotonic() - browser_trace_started_at, time.time(), threading.current_thread().name,
+    )
     context = browser.new_context(
         user_agent=_USER_AGENT,
         locale="en-US",
@@ -349,6 +482,10 @@ def _ensure_context():
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"Windows"',
         },
+    )
+    logger.info(
+        "BROWSER_TRACE scraper=YouTube event=after_new_context elapsed=%.3fs timestamp=%.3f thread=%s",
+        time.monotonic() - browser_trace_started_at, time.time(), threading.current_thread().name,
     )
     # Mask the webdriver flag that YouTube uses for bot detection
     context.add_init_script("""
@@ -366,6 +503,62 @@ def _ensure_context():
     handle.uses = 1
     logger.info("Launched a new browser context on %s.", threading.current_thread().name)
     return context
+
+
+# --- Startup pre-warm --------------------------------------------------
+# Same fix as twitter_scraper.py's / instagram_scraper.py's identically-
+# named block: setup alone (this thread's own sync_playwright().start() +
+# attaching to the shared Chromium process + new_context()) was regularly
+# taking 22-46s+ under this app's shared-browser contention at the start
+# of an analysis run - see the OUTER_HARD_TIMEOUT_SECONDS block above.
+# That cost is a ONE-TIME, per-worker-thread cost (_ensure_context above
+# reuses a live context on later calls via a cheap `ctx.pages` check), so
+# pay it once here, in the background, at module import time - i.e. when
+# the FastAPI app boots up - well before the first real request in
+# practice, since the user still has to go through Company/Product
+# Discovery and pick a product before this module's
+# scrape_youtube_comments() is ever called.
+#
+# MAX_BROWSER_WORKERS separate jobs are submitted (not just one) because
+# a single analysis run can have up to 3 concurrent YouTube jobs in
+# flight at once (one "General"/company-wide job plus one per selected
+# product - see app.py's per-job asyncio.gather), each landing on its own
+# worker thread. Submitting N tasks up front spreads across N distinct
+# threads instead of piling onto one, so every thread a real job could be
+# handed to is already warm.
+#
+# Best-effort only and never blocks import: each job runs on _EXECUTOR's
+# own worker threads, and any failure is caught and logged - the first
+# real request then simply falls back to paying the setup cost itself,
+# exactly as it did before this change.
+def _warm_up_browser_context() -> None:
+    # Without this guard, this raises NotImplementedError on every warm-up
+    # thread on Windows: app.py sets WindowsSelectorEventLoopPolicy
+    # process-wide at import time (see browser_utils.py), but only the
+    # Proactor loop can launch subprocesses on Windows, and Playwright's
+    # sync API spawns its driver as a subprocess. The real request path
+    # (_run_sync(), below) already re-asserts Proactor for the same
+    # reason; this warm-up needs its own copy since it runs on a separate
+    # thread, before any real request ever calls _run_sync().
+    if sys.platform.startswith("win"):
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    try:
+        _ensure_context()
+        logger.info(
+            "YouTube: browser context pre-warmed on %s.",
+            threading.current_thread().name,
+        )
+    except Exception:
+        logger.exception(
+            "YouTube: background browser context warm-up failed on %s "
+            "(non-fatal - the first real request will pay the setup "
+            "cost itself instead, same as before this change).",
+            threading.current_thread().name,
+        )
+
+
+for _ in range(MAX_BROWSER_WORKERS):
+    _EXECUTOR.submit(_warm_up_browser_context)
 
 
 _CHANNEL_ID_RE = re.compile(r"^UC[\w-]{22}$")
@@ -832,6 +1025,139 @@ def _httpx_video_urls(page_url: str, limit: int) -> List[str]:
     return [f"https://www.youtube.com/watch?v={vid}" for vid in ids]
 
 
+def _video_title_text(renderer: dict) -> str:
+    try:
+        title_obj = renderer.get("title") or {}
+        runs = title_obj.get("runs")
+        if runs:
+            return "".join(r.get("text", "") for r in runs)
+        return title_obj.get("simpleText", "") or ""
+    except Exception:
+        return ""
+
+
+def _video_ids_and_titles_from_initial_data(data: dict, limit: int) -> List[Tuple[str, str]]:
+    """Like ``_video_ids_from_initial_data``, but also captures each
+    result's rendered title text so callers can apply relevance
+    filtering (product-name token matching, see ``_title_matches_product``)
+    BEFORE ever visiting a video - no extra fetch, since the title is
+    already sitting right next to videoId in the same ``videoRenderer``
+    node this walk was already reading.
+
+    A renderer whose title text can't be extracted (unrecognized shape)
+    still contributes its video ID with an empty-string title rather than
+    being dropped - callers treat an empty title as "unknown, don't
+    filter it out" (see ``_title_matches_product``), so a title-JSON
+    shape change degrades to "trust the search" instead of silently
+    zeroing out every candidate.
+    """
+    pairs: List[Tuple[str, str]] = []
+    seen = set()
+
+    def _walk(node) -> None:
+        if len(pairs) >= limit:
+            return
+        if isinstance(node, dict):
+            renderer = node.get("videoRenderer")
+            if isinstance(renderer, dict):
+                vid = renderer.get("videoId")
+                if vid and vid not in seen:
+                    seen.add(vid)
+                    pairs.append((vid, _video_title_text(renderer)))
+            for value in node.values():
+                if len(pairs) >= limit:
+                    return
+                _walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                if len(pairs) >= limit:
+                    return
+                _walk(item)
+
+    _walk(data)
+    return pairs[:limit]
+
+
+def _httpx_video_urls_with_titles(page_url: str, limit: int) -> List[Tuple[str, str]]:
+    html = _fetch_yt_html(page_url)
+    if not html:
+        return []
+    data = _extract_yt_initial_data(html)
+    if not data:
+        return []
+    pairs = _video_ids_and_titles_from_initial_data(data, limit)
+    return [(f"https://www.youtube.com/watch?v={vid}", title) for vid, title in pairs]
+
+
+# --- Product-title relevance gate (product-centric tiers only) -------------
+# A search hit for "<product> review" is a good signal but not a guarantee -
+# YouTube's own ranking also surfaces comparison/roundup videos ("Top 10
+# budget earbuds") and wrong-model videos that happen to share enough
+# keyword overlap to rank. Those videos are real and their comments are
+# real, but most of those comments are NOT about the selected product -
+# exactly the "generic content mislabeled as product-specific" failure
+# principle #1 in ARCHITECTURE.md §3 warns about, just arriving through
+# search-ranking noise instead of the (already-fixed, see the
+# GATED TO product_name-LESS comment below) General-fallback route.
+#
+# This mirrors twitter_scraper.py's _mentions_product philosophy - biased
+# toward false negatives over false positives - rather than reusing it
+# directly, since a YouTube title is free-form creator copy (emoji, price
+# call-outs, "review" phrasing) rather than a tweet, so requiring every
+# token would likely reject a lot of genuinely-relevant videos. Instead
+# this requires a clear majority (>=60%, rounded up) of the product's own
+# meaningful tokens to appear in the title as whole words - not a
+# substring match, so a product numbered "55" cannot match a title
+# containing "255". Only applied to the httpx/InnerTube search path (the
+# dominant path per _search_youtube's own comments - "what actually
+# fixes" most searches); the Playwright DOM search fallback is
+# deliberately left unfiltered, both to keep this change small and
+# because that path only runs at all when httpx found zero candidates,
+# i.e. there is nothing to filter yet.
+_TITLE_MATCH_STOPWORDS = frozenset({
+    "the", "a", "an", "for", "with", "and", "of", "in", "on", "to", "by",
+})
+
+
+def _product_tokens(product_name: str) -> List[str]:
+    """Meaningful word/number tokens extracted from a product name.
+
+    Strips only a small stopword list of connector words - deliberately
+    NOT stripping things like "pro"/"plus"/model numbers, since those are
+    exactly the tokens that distinguish one SKU from a related one (e.g.
+    "Rockerz 255" vs "Rockerz 255 Pro+") and are the most important
+    signal to keep.
+    """
+    raw = re.findall(r"[a-z0-9]+", (product_name or "").lower())
+    tokens = [t for t in raw if t not in _TITLE_MATCH_STOPWORDS]
+    # If the product name is somehow made up entirely of stopwords, fall
+    # back to the raw tokens rather than returning an empty list - an
+    # empty product_tokens list is treated as "nothing to check" (always
+    # matches) by _title_matches_product, which would silently disable
+    # filtering for that product rather than just being lenient.
+    return tokens or raw
+
+
+def _title_matches_product(title: str, product_tokens: List[str]) -> bool:
+    """Conservative relevance gate for the product-centric search tiers
+    only - never applied to the General/company-wide tiers, which have no
+    specific product to be wrong about (see the GATED TO product_name-LESS
+    comment further down this file).
+
+    An empty ``product_tokens`` (nothing meaningful to check) or an empty
+    ``title`` (extraction failed / unrecognized shape) both pass by
+    default - fail OPEN, not closed, so this can only narrow an already-
+    found candidate list, never silently zero one out because of its own
+    internal parsing gap.
+    """
+    if not product_tokens or not title:
+        return True
+    title_tokens = set(re.findall(r"[a-z0-9]+", title.lower()))
+    hits = sum(1 for t in product_tokens if t in title_tokens)
+    required = max(1, math.ceil(len(product_tokens) * 0.6))
+    return hits >= required
+
+
 def _extract_innertube_context(html: str) -> Optional[Tuple[str, str]]:
     key_match = _YT_INNERTUBE_KEY_RE.search(html)
     if not key_match:
@@ -967,7 +1293,7 @@ def _fetch_comments_via_innertube(video_url: str, limit: int, time_left) -> List
 
     comments: List[str] = []
     pages = 0
-    while continuation and len(comments) < limit and pages < 5 and time_left() > 2:
+    while continuation and len(comments) < limit and pages < 80 and time_left() > 2:
         payload = _innertube_comments_page(
             api_key, client_version, continuation, timeout=min(6.0, max(2.0, time_left())),
         )
@@ -979,7 +1305,7 @@ def _fetch_comments_via_innertube(video_url: str, limit: int, time_left) -> List
     return comments[:limit]
 
 
-def _search_youtube(page, query: str, time_left) -> List[str]:
+def _search_youtube(page, query: str, time_left, product_tokens: Optional[List[str]] = None) -> List[str]:
     """Run one YouTube search for ``query`` and return candidate video URLs.
 
     Shared by every search-based discovery tier - the product-review and
@@ -993,12 +1319,45 @@ def _search_youtube(page, query: str, time_left) -> List[str]:
     "Timeout 7062ms exceeded" search-navigation failures in the log, since
     it doesn't touch Chromium at all. Falls back to the existing
     Playwright-based search only if that path comes back empty.
+
+    ``product_tokens``: only passed by the product-centric tiers (see
+    ``_run_sync``). When given, httpx results are filtered through
+    ``_title_matches_product`` before being returned - no extra fetch,
+    since title text rides along in the same JSON response. Left as
+    ``None`` (the default) for every other caller, in particular the
+    General/company-wide tiers, which keep exactly their previous
+    unfiltered behavior - there's no specific product to filter against
+    there, and this default means this change can't affect that path.
     """
     try:
-        video_urls = _httpx_video_urls(
-            f"https://www.youtube.com/results?search_query={quote_plus(query)}",
-            VIDEO_CANDIDATES_TO_COLLECT,
-        )
+        if product_tokens:
+            pairs = _httpx_video_urls_with_titles(
+                f"https://www.youtube.com/results?search_query={quote_plus(query)}",
+                VIDEO_CANDIDATES_TO_COLLECT,
+            )
+            if pairs:
+                matched = [u for u, t in pairs if _title_matches_product(t, product_tokens)]
+                logger.info(
+                    "YouTube scrape: httpx search for %r found %d video(s), "
+                    "%d passed the product-title relevance check (no "
+                    "browser needed).",
+                    query, len(pairs), len(matched),
+                )
+                # Candidates existed but (possibly) none looked genuinely
+                # about this product - a relevance dead end, not a
+                # discovery failure. Return as-is (even if empty) rather
+                # than falling through to the unfiltered DOM search below,
+                # which would just re-find this same set without titles to
+                # check against; the caller's tier loop moves on to the
+                # next tier instead (same "tier is a dead end" handling as
+                # a search that found 0 videos at all).
+                return matched
+            video_urls = []
+        else:
+            video_urls = _httpx_video_urls(
+                f"https://www.youtube.com/results?search_query={quote_plus(query)}",
+                VIDEO_CANDIDATES_TO_COLLECT,
+            )
     except Exception:
         logger.exception("YouTube httpx search failed for query=%r.", query)
         video_urls = []
@@ -1303,9 +1662,22 @@ def _scroll_comments_until_idle(page, time_left, remaining_budget: int) -> List[
     return comments
 
 
-def _run_sync(company_name: str, videos_url: str, product_name: str = "", product_brand: str = "") -> List[str]:
+def _run_sync(
+    company_name: str,
+    videos_url: str,
+    product_name: str = "",
+    product_brand: str = "",
+    _overall_start: Optional[float] = None,
+) -> List[str]:
     if sys.platform.startswith("win"):
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+    # Fallback for any direct/legacy caller that doesn't pass
+    # _overall_start: behaves like a fresh clock starting right here,
+    # same as before this fix - only scrape_youtube_comments() below (the
+    # real entry point) passes the true, pre-setup anchor.
+    if _overall_start is None:
+        _overall_start = time.monotonic()
 
     setup_start = time.monotonic()
 
@@ -1325,24 +1697,53 @@ def _run_sync(company_name: str, videos_url: str, product_name: str = "", produc
     videos_attempted = 0
     last_videos_found = 0
     try:
+        logger.info(
+            "BROWSER_TRACE scraper=YouTube event=before_new_page elapsed=%.3fs timestamp=%.3f thread=%s",
+            time.monotonic() - getattr(_browser_trace, "ensure_context_started_at", time.monotonic()), time.time(), threading.current_thread().name,
+        )
         page = context.new_page()
+        logger.info(
+            "BROWSER_TRACE scraper=YouTube event=after_new_page elapsed=%.3fs timestamp=%.3f thread=%s",
+            time.monotonic() - getattr(_browser_trace, "ensure_context_started_at", time.monotonic()), time.time(), threading.current_thread().name,
+        )
         page.set_default_timeout(12000)
 
-        # The internal time budget clock starts here, only AFTER browser
-        # launch, context creation, and page creation have all finished -
-        # not before. Starting the clock earlier meant Chromium/context
-        # startup time silently ate into the budget before navigation ever
-        # got a chance to run, which is exactly what produced "Skipping
-        # navigation: out of time budget" before the page had even been
-        # opened.
         setup_elapsed = time.monotonic() - setup_start
         start = time.monotonic()
-        deadline = start + TIME_BUDGET_SECONDS
+        # Deadline anchored to the OUTER hard timeout (app.py's
+        # YOUTUBE_TIMEOUT_SECONDS), counted from when this job actually
+        # started (_overall_start) - not a fresh TIME_BUDGET_SECONDS clock
+        # that ignores how much of the outer budget setup already used.
+        # This guarantees _run_sync() always leaves SAFETY_MARGIN_SECONDS
+        # of real slack for the result to make it back through
+        # run_in_executor()/wait_for(), no matter how long setup took
+        # under this app's shared-browser contention. See the
+        # OUTER_HARD_TIMEOUT_SECONDS block above.
+        deadline = _overall_start + OUTER_HARD_TIMEOUT_SECONDS - SAFETY_MARGIN_SECONDS
+        remaining_budget = deadline - start
+
         logger.info(
-            "YouTube scrape: browser/context/page setup took %.1fs; "
-            "starting %ds navigation+scrape budget now.",
-            setup_elapsed, TIME_BUDGET_SECONDS,
+            "YouTube scrape: browser/context/page setup took %.1fs "
+            "(%.1fs elapsed since job start); %.1fs left for "
+            "navigation+scrape before the safety-margined internal "
+            "deadline (outer cap=%ds, safety margin=%.1fs).",
+            setup_elapsed,
+            start - _overall_start,
+            remaining_budget,
+            OUTER_HARD_TIMEOUT_SECONDS,
+            SAFETY_MARGIN_SECONDS,
         )
+
+        if remaining_budget <= MIN_USEFUL_BUDGET_SECONDS:
+            logger.warning(
+                "YouTube scrape: only %.1fs left for %r after a %.1fs "
+                "setup (job start to now: %.1fs) - not enough time to "
+                "attempt navigation; returning early instead of risking "
+                "the outer hard timeout.",
+                remaining_budget, company_name, setup_elapsed,
+                time.monotonic() - _overall_start,
+            )
+            return normalize_comments(results)[:MAX_TOTAL_COMMENTS]
 
         def time_left() -> float:
             return deadline - time.monotonic()
@@ -1425,7 +1826,9 @@ def _run_sync(company_name: str, videos_url: str, product_name: str = "", produc
         # by itself enough to stop on.
         succeeded = False
         search_tiers = []
+        product_tokens: List[str] = []
         if product_name:
+            product_tokens = _product_tokens(product_name)
             search_tiers.append(("product_review", f"{product_name} review"))
             brand = (product_brand or company_name or "").strip()
             if brand and brand.lower() != product_name.strip().lower():
@@ -1435,7 +1838,7 @@ def _run_sync(company_name: str, videos_url: str, product_name: str = "", produc
             if time_left() <= _MIN_TIME_FOR_ANOTHER_TIER_SECONDS:
                 logger.info("YouTube scrape: skipping tier %r — out of time budget.", label)
                 break
-            video_urls = _search_youtube(page, query, time_left)
+            video_urls = _search_youtube(page, query, time_left, product_tokens=product_tokens)
             last_videos_found = len(video_urls) or last_videos_found
             if not video_urls:
                 logger.info("YouTube scrape: tier %r search (%r) found 0 videos.", label, query)
@@ -1456,7 +1859,26 @@ def _run_sync(company_name: str, videos_url: str, product_name: str = "", produc
         # --- Priority 3: existing official-channel logic, then (as before)
         # a plain company-name search - only reached if the tiers above
         # never landed a single usable comment.
-        if not succeeded and time_left() > _MIN_TIME_FOR_ANOTHER_TIER_SECONDS:
+        #
+        # GATED TO product_name-LESS (General/company-wide) JOBS ONLY.
+        # Confirmed root cause of a real data-quality bug: when a
+        # PER-PRODUCT job's targeted "<product> review" search came up
+        # thin, this used to fall through to scraping the brand's general
+        # channel (any recent video, unrelated to that product) and then a
+        # plain company-name search - and whatever comments those found
+        # got attributed to that specific product anyway. Production logs
+        # showed a product whose own targeted search found only 17
+        # candidate videos ending up with 1,405 "final" comments credited
+        # to it, almost all of it generic brand-channel content that was
+        # never actually about that product. These broad tiers are
+        # legitimately appropriate for the General job (which has no
+        # specific product to be wrong about - it's supposed to be
+        # brand-wide, same as Twitter/Instagram), so they still run there;
+        # a per-product job that exhausts its targeted tiers now simply
+        # returns what it genuinely found (possibly little or nothing)
+        # instead of backfilling with irrelevant content mislabeled as
+        # product-specific.
+        if not product_name and not succeeded and time_left() > _MIN_TIME_FOR_ANOTHER_TIER_SECONDS:
             video_urls: List[str] = []
             try:
                 video_urls = _httpx_video_urls(videos_url, VIDEO_CANDIDATES_TO_COLLECT)
@@ -1562,6 +1984,14 @@ def _run_sync(company_name: str, videos_url: str, product_name: str = "", produc
 
 
 async def scrape_youtube_comments(company_data: Dict[str, str]) -> List[str]:
+    # Anchor point for the real wall-clock deadline (see the
+    # OUTER_HARD_TIMEOUT_SECONDS block above). Captured before the
+    # channel/handle resolution fallback and before this job is even
+    # submitted to the executor, so _run_sync()'s deadline reflects the
+    # FULL time app.py's outer wait_for() has already been counting
+    # against this coroutine - not just the part after setup finishes.
+    _overall_start = time.monotonic()
+
     target = (
         company_data.get("youtube_url")
         or company_data.get("youtube")
@@ -1572,17 +2002,54 @@ async def scrape_youtube_comments(company_data: Dict[str, str]) -> List[str]:
     if not target:
         company_name = (company_data.get("company_name") or "").strip()
         if company_name:
-            try:
-                target = await loop.run_in_executor(
-                    _EXECUTOR, find_social_profile_url, company_name, "youtube",
-                )
-            except Exception:
-                target = ""
-            if target:
-                logger.info(
-                    "YouTube scrape: no channel from the site scan; "
-                    "search fallback found %r for %r.", target, company_name,
-                )
+            cache_key = company_name.strip().lower()
+            should_resolve = False
+            wait_event: Optional[threading.Event] = None
+            with _channel_resolution_lock:
+                if cache_key in _channel_resolution_cache:
+                    target = _channel_resolution_cache[cache_key]
+                else:
+                    wait_event = _channel_resolution_events.get(cache_key)
+                    if wait_event is None:
+                        wait_event = threading.Event()
+                        _channel_resolution_events[cache_key] = wait_event
+                        should_resolve = True
+
+            if should_resolve:
+                try:
+                    target = await loop.run_in_executor(
+                        _EXECUTOR, find_social_profile_url, company_name, "youtube",
+                    )
+                except Exception:
+                    target = ""
+                finally:
+                    # Always cache and always signal waiters, even on
+                    # exception - a raised find_social_profile_url() must
+                    # not leave concurrent jobs for the same company
+                    # blocked on wait_event.wait() forever.
+                    with _channel_resolution_lock:
+                        _channel_resolution_cache[cache_key] = target
+                    wait_event.set()
+                if target:
+                    logger.info(
+                        "YouTube scrape: no channel from the site scan; "
+                        "search fallback found %r for %r.", target, company_name,
+                    )
+            elif wait_event is not None:
+                # Another job (General or a sibling product) is already
+                # resolving this exact company's channel - wait for its
+                # result instead of firing a duplicate search. This is what
+                # collapses the 3 identical DuckDuckGo queries seen in the
+                # log down to 1.
+                await loop.run_in_executor(_EXECUTOR, wait_event.wait)
+                with _channel_resolution_lock:
+                    target = _channel_resolution_cache.get(cache_key, "")
+                if target:
+                    logger.info(
+                        "YouTube scrape: reused channel %r for %r, resolved "
+                        "moments ago by a concurrent job in the same run "
+                        "(no duplicate search fired).", target, company_name,
+                    )
         if not target:
             logger.info(
                 "YouTube scrape: no channel from the site scan and the "
@@ -1602,7 +2069,7 @@ async def scrape_youtube_comments(company_data: Dict[str, str]) -> List[str]:
 
     try:
         return await loop.run_in_executor(
-            _EXECUTOR, _run_sync, company_name, videos_url, product_name, product_brand,
+            _EXECUTOR, _run_sync, company_name, videos_url, product_name, product_brand, _overall_start,
         )
     except Exception:
         logger.exception("Unhandled error scraping YouTube comments for %r.", company_name)

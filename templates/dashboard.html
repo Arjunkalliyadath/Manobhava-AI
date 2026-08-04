@@ -6,43 +6,24 @@
   <title>{{ (product_title | default(company.company_name) | default("Product")) | title }} — Product Intelligence — ManobhavaAI</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-    :root {
-      --bg:       #F7F2E9;
-      --surface:  #FFFDF8;
-      --border:   #E8DDCF;
-      --primary:  #5A4FCF;
-      --primary-l: rgba(90,79,207,0.08);
-      --positive: #2E7D32;
-      --negative: #B3264A;
-      --neutral:  #8A6A1F;
-      --text:     #24211D;
-      --muted:    #7B746C;
-      --yellow-card: #F8E08E;
-      --pink-card:   #F7C7D9;
-      --blue-card:   #D9E7FF;
-      --green-card:  #D8F2C2;
-      --dark:        #1B1B1B;
-
-      /* Consistent spacing / radius / shadow scale for a calmer, enterprise feel */
-      --r-sm: 10px;
-      --r-md: 14px;
-      --r-lg: 16px;
-      --shadow-sm: 0 1px 2px rgba(36,33,29,.04), 0 1px 1px rgba(36,33,29,.03);
-      --shadow-md: 0 4px 14px rgba(36,33,29,.06);
-      --shadow-lg: 0 10px 26px rgba(36,33,29,.08);
-    }
+    /* Design tokens (--bg, --surface, --primary, --positive, --r-md,
+       --shadow-md, etc.) now come from the shared /static/style.css,
+       linked in <head> above — this keeps every template on one
+       palette instead of three independently-drifting copies. See
+       that file for the full token set and the design rationale. */
 
     html { scroll-behavior: smooth; }
     body {
       min-height: 100vh;
       background: var(--bg);
       color: var(--text);
-      font-family: 'Poppins', -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-family: var(--font-body);
       font-size: 14.5px;
       line-height: 1.5;
     }
@@ -216,9 +197,9 @@
     .sentbrk-bar-row--neg .sentbrk-bar-fill { animation-delay: .22s; }
     .sentbrk-bar-row--neu .sentbrk-bar-fill { animation-delay: .34s; }
 
-    .sentbrk-bar-fill--pos { background: linear-gradient(90deg, #2E7D32, #57B860); }
-    .sentbrk-bar-fill--neg { background: linear-gradient(90deg, #B3264A, #E0567D); }
-    .sentbrk-bar-fill--neu { background: linear-gradient(90deg, #8A6A1F, #C79A3A); }
+    .sentbrk-bar-fill--pos { background: linear-gradient(90deg, var(--positive), #4FA36C); }
+    .sentbrk-bar-fill--neg { background: linear-gradient(90deg, var(--negative), #C96A62); }
+    .sentbrk-bar-fill--neu { background: linear-gradient(90deg, var(--neutral), #9297A3); }
 
     @keyframes sentbrkGrow { to { transform: scaleX(1); } }
 
@@ -289,7 +270,7 @@
 
     
     .comments-list {
-      display: flex; flex-direction: column; gap: .85rem;
+      display: flex; flex-direction: column; gap: .6rem;
       max-height: 620px; overflow-y: auto; overflow-x: hidden;
       padding: .2rem .3rem .2rem 0; margin-top: .2rem;
       scrollbar-width: thin; scrollbar-color: var(--border) transparent;
@@ -304,7 +285,7 @@
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: 16px;
-      padding: 1rem 1.15rem 1rem 1.35rem;
+      padding: .8rem 1rem .8rem 1.25rem;
       display: flex;
       gap: 0;
       align-items: stretch;
@@ -316,27 +297,58 @@
       position: absolute; left: 0; top: 0; bottom: 0; width: 4px;
       border-radius: 0; flex-shrink: 0; margin-top: 0;
     }
-    .comment-card-inner { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: .6rem; }
+    .comment-card-inner { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: .45rem; }
     .comment-top-row { display: flex; align-items: center; justify-content: space-between; gap: .6rem; flex-wrap: wrap; }
     .comment-body { flex: 1; min-width: 0; }
     .comment-text {
-      font-size: .875rem; line-height: 1.65; color: var(--text);
-      position: relative; padding-left: 1.1rem;
+      font-size: 1rem; line-height: 1.6; color: var(--text); font-weight: 500;
+      position: relative; padding-left: 1.2rem;
+      word-break: break-word;
     }
     .comment-text::before {
-      content: "\201C"; position: absolute; left: -.15rem; top: -.3rem;
-      font-size: 1.4rem; font-weight: 800; color: var(--primary); opacity: .45;
+      content: "\201C"; position: absolute; left: -.15rem; top: -.35rem;
+      font-size: 1.7rem; font-weight: 800; color: var(--primary); opacity: .4;
       font-family: Georgia, serif; line-height: 1;
     }
-    .comment-meta { display: flex; gap: .5rem; margin-top: .55rem; font-size: .72rem; color: var(--muted); align-items: center; flex-wrap: wrap; }
+    .comment-footer-row {
+      display: flex; align-items: center; gap: .5rem; flex-wrap: wrap;
+      margin-top: .6rem; padding-top: .5rem; border-top: 1px solid var(--border);
+    }
+    .platform-badge-sm { padding: .12rem .5rem .12rem .3rem; }
+    .platform-badge-sm .platform-badge-icon { width: 14px; height: 14px; font-size: .5rem; }
+    .platform-badge-sm .platform-badge-name { font-size: .66rem; }
+    .badge-sm { font-size: .6rem; padding: .16rem .5rem; }
+    .read-more-btn {
+      display: inline-block; margin: .3rem 0 0 1.1rem;
+      background: none; border: none; padding: 0;
+      font-family: inherit; font-size: .76rem; font-weight: 700;
+      color: var(--primary); cursor: pointer; letter-spacing: .01em;
+    }
+    .read-more-btn:hover { text-decoration: underline; }
+    .comment-meta { display: flex; gap: .5rem; margin-top: .4rem; font-size: .72rem; color: var(--muted); align-items: center; flex-wrap: wrap; }
+    .comment-meta-right { display: inline-flex; align-items: center; gap: .5rem; margin-left: auto; }
+    .copy-btn {
+      display: inline-flex; align-items: center; gap: .3rem;
+      background: none; border: 1px solid var(--border); border-radius: 100px;
+      padding: .16rem .55rem; font-family: inherit; font-size: .68rem; font-weight: 600;
+      color: var(--muted); cursor: pointer;
+      transition: border-color .15s ease, color .15s ease, background .15s ease;
+    }
+    .copy-btn:hover { border-color: var(--primary); color: var(--primary); }
+    .copy-btn.copied { border-color: var(--positive); color: var(--positive); background: var(--positive-soft); }
+    .copy-btn-icon {
+      width: 11px; height: 11px; flex-shrink: 0; background: currentColor;
+      -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='9' y='9' width='11' height='11' rx='2'/%3E%3Cpath d='M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1'/%3E%3C/svg%3E") center / contain no-repeat;
+      mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='9' y='9' width='11' height='11' rx='2'/%3E%3Cpath d='M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1'/%3E%3C/svg%3E") center / contain no-repeat;
+    }
     .badge {
       display: inline-block; padding: .2rem .55rem; border-radius: 100px;
       font-size: .64rem; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
       border: 1px solid transparent; flex-shrink: 0;
     }
-    .badge-pos { background: #f0fdf4; color: var(--positive); border-color: rgba(46,125,50,.18); }
-    .badge-neg { background: #fef2f2; color: var(--negative); border-color: rgba(179,38,74,.18); }
-    .badge-neu { background: #fffbeb; color: var(--neutral); border-color: rgba(138,106,31,.18); }
+    .badge-pos { background: var(--positive-soft); color: var(--positive); border-color: rgba(46,125,79,.22); }
+    .badge-neg { background: var(--negative-soft); color: var(--negative); border-color: rgba(178,59,51,.22); }
+    .badge-neu { background: var(--neutral-soft); color: var(--neutral); border-color: rgba(107,114,128,.22); }
 
     /* --- Platform badge (icon + name), color driven by --platform-color --- */
     .platform-badge {
@@ -379,7 +391,7 @@
 
     /* --- Reviewer / rating meta used by the Website Reviews cards --- */
     .comment-author { font-weight: 700; color: var(--text); }
-    .comment-rating { color: #C79A3A; font-weight: 700; letter-spacing: .02em; }
+    .comment-rating { color: var(--accent); font-weight: 700; letter-spacing: .02em; }
 
     /* --- Loading skeleton (available for async use; not wired to any script) --- */
     .comment-skeleton {
@@ -469,9 +481,9 @@
       display: inline-block; margin-top: .5rem; padding: .18rem .6rem;
       border-radius: 100px; font-size: .74rem; font-weight: 600;
     }
-    .score-label.very-positive, .score-label.positive { background: #f0fdf4; color: var(--positive); }
-    .score-label.mixed { background: #fffbeb; color: var(--neutral); }
-    .score-label.negative, .score-label.very-negative { background: #fef2f2; color: var(--negative); }
+    .score-label.very-positive, .score-label.positive { background: var(--positive-soft); color: var(--positive); }
+    .score-label.mixed { background: var(--neutral-soft); color: var(--neutral); }
+    .score-label.negative, .score-label.very-negative { background: var(--negative-soft); color: var(--negative); }
     .score-label.no-data { background: var(--bg); color: var(--muted); }
 
     
@@ -621,9 +633,9 @@
       animation: brandrepGmapsGrow 1s cubic-bezier(.16,1,.3,1) forwards; animation-delay: .2s;
     }
     @keyframes brandrepGmapsGrow { to { transform: scaleX(1); } }
-    .brandrep-gmaps-bar-fill--excellent, .brandrep-gmaps-bar-fill--good { background: linear-gradient(90deg, var(--positive), #57B860); }
-    .brandrep-gmaps-bar-fill--mixed { background: linear-gradient(90deg, var(--neutral), #C79A3A); }
-    .brandrep-gmaps-bar-fill--poor { background: linear-gradient(90deg, var(--negative), #E0567D); }
+    .brandrep-gmaps-bar-fill--excellent, .brandrep-gmaps-bar-fill--good { background: linear-gradient(90deg, var(--positive), #4FA36C); }
+    .brandrep-gmaps-bar-fill--mixed { background: linear-gradient(90deg, var(--neutral), #9297A3); }
+    .brandrep-gmaps-bar-fill--poor { background: linear-gradient(90deg, var(--negative), #C96A62); }
 
     .brandrep-gmaps-empty { display: flex; flex-direction: column; align-items: center; text-align: center; padding: .6rem .5rem .2rem; gap: .4rem; }
     .brandrep-gmaps-empty-icon {
@@ -691,6 +703,33 @@
     .sentiment-table tr:last-child td { border-bottom: none; }
     .mini-bar { display: flex; height: 6px; border-radius: 100px; overflow: hidden; width: 100%; min-width: 90px; }
 
+    /* --- Product Intelligence: compact spec grid (replaces long thin table rows) --- */
+    .spec-grid {
+      display: grid; grid-template-columns: 1fr 1fr; gap: .5rem;
+    }
+    .spec-item {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+      padding: .5rem .7rem; min-width: 0;
+    }
+    .spec-item-full { grid-column: 1 / -1; }
+    .spec-item-label {
+      font-size: .62rem; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+      color: var(--muted); margin-bottom: .2rem;
+    }
+    .spec-item-value {
+      font-size: .82rem; font-weight: 600; color: var(--text);
+      line-height: 1.4; word-break: break-word;
+    }
+    .spec-hidden { display: none; }
+    .spec-toggle-btn {
+      display: inline-block; margin-top: .65rem;
+      background: none; border: none; padding: 0;
+      font-family: inherit; font-size: .76rem; font-weight: 700;
+      color: var(--primary); cursor: pointer;
+    }
+    .spec-toggle-btn:hover { text-decoration: underline; }
+    @media (max-width: 480px) { .spec-grid { grid-template-columns: 1fr; } }
+
 
     /* Brand + KPI cards: clean surfaces with a restrained accent, not full pastel fills */
     .brand-icon {
@@ -705,7 +744,7 @@
       padding: 1.35rem 1.5rem;
       box-shadow: var(--shadow-md);
     }
-    .company-eyebrow { color: #F0D877; }
+    .company-eyebrow { color: #D9A968; }
     .company-name { color: #fff; }
     .company-link {
       background: rgba(255,255,255,.08);
@@ -720,10 +759,10 @@
       background: var(--surface);
       border-top: 3px solid var(--border);
     }
-    .card--total    { border-top-color: #D9B23C; }
+    .card--total    { border-top-color: var(--accent); }
     .card--positive { border-top-color: var(--positive); }
     .card--negative { border-top-color: var(--negative); }
-    .card--neutral   { border-top-color: #3B6FE0; }
+    .card--neutral   { border-top-color: var(--neutral); }
     .card--total .card-label,
     .card--positive .card-label,
     .card--negative .card-label,
@@ -790,7 +829,7 @@
     .herohead-id { display: flex; align-items: flex-start; gap: 1rem; }
     .herohead-avatar {
       flex-shrink: 0; width: 52px; height: 52px; border-radius: 16px;
-      background: linear-gradient(150deg, #7A6FE0, #5A4FCF);
+      background: linear-gradient(150deg, #D4914F, var(--accent));
       display: flex; align-items: center; justify-content: center;
       font-size: 1.25rem; font-weight: 700; color: #fff;
       box-shadow: var(--shadow-md);
@@ -875,7 +914,7 @@
     }
     .analytics-hero-icon {
       width: 42px; height: 42px; border-radius: 13px; flex-shrink: 0;
-      background: linear-gradient(150deg, #7A6FE0, var(--primary));
+      background: linear-gradient(150deg, #D4914F, var(--primary));
       display: flex; align-items: center; justify-content: center;
       color: #fff; box-shadow: var(--shadow-md);
     }
@@ -911,10 +950,10 @@
       display: flex; align-items: center; justify-content: center;
       background: rgba(255,255,255,.6);
     }
-    .card--total .kpi-icon    { color: #8A6A1F; }
+    .card--total .kpi-icon    { color: var(--accent); }
     .card--positive .kpi-icon { color: var(--positive); }
     .card--negative .kpi-icon { color: var(--negative); }
-    .card--neutral .kpi-icon  { color: #1D4ED8; }
+    .card--neutral .kpi-icon  { color: var(--neutral); }
 
     /* --- grid-4 KPI row polish (scoped: fires only where .analytics-card is present) --- */
     .grid-4 { gap: .85rem; }
@@ -1000,7 +1039,7 @@
     .pi-product-cell { display: flex; align-items: center; gap: .65rem; min-width: 140px; }
     .pi-avatar {
       flex-shrink: 0; width: 30px; height: 30px; border-radius: 9px;
-      background: linear-gradient(150deg, #7A6FE0, var(--primary));
+      background: linear-gradient(150deg, #D4914F, var(--primary));
       color: #fff; font-size: .75rem; font-weight: 700;
       display: flex; align-items: center; justify-content: center;
       box-shadow: 0 4px 10px rgba(90,79,207,.28);
@@ -1703,13 +1742,24 @@
         {% endif %}
 
         {% if p.specifications %}
+        {% set _spec_items = p.specifications.items() | list %}
+        {% set _spec_limit = 6 %}
         <div style="margin-top:.9rem;">
-          <div class="card-sub" style="font-weight:600; text-transform:uppercase; letter-spacing:.05em; font-size:.68rem; margin-bottom:.4rem;">Specifications</div>
-          <table class="sentiment-table" style="margin-top:0;">
-            {% for key, value in p.specifications.items() %}
-            <tr><td style="font-weight:600; width:40%;">{{ key }}</td><td>{{ value }}</td></tr>
+          <div class="card-sub" style="font-weight:600; text-transform:uppercase; letter-spacing:.05em; font-size:.68rem; margin-bottom:.5rem;">Specifications</div>
+          <div class="spec-grid" data-limit="{{ _spec_limit }}">
+            {% for key, value in _spec_items %}
+            {% set _val_str = value | string %}
+            <div class="spec-item{{ ' spec-item-full' if (_val_str | length) > 28 else '' }}{{ ' spec-hidden' if loop.index0 >= _spec_limit else '' }}">
+              <div class="spec-item-label">{{ key }}</div>
+              <div class="spec-item-value">{{ value }}</div>
+            </div>
             {% endfor %}
-          </table>
+          </div>
+          {% if _spec_items | length > _spec_limit %}
+          <button type="button" class="spec-toggle-btn" data-expanded="false"
+                  data-show-text="Show all {{ _spec_items | length }} specifications ▼"
+                  onclick="toggleSpecGrid(this)">Show all {{ _spec_items | length }} specifications ▼</button>
+          {% endif %}
         </div>
         {% endif %}
 
@@ -1735,20 +1785,18 @@
             <div class="comment-card" data-platform="Website">
               <div class="comment-sentiment-dot" style="background: var(--neutral);"></div>
               <div class="comment-card-inner">
-                <div class="comment-top-row">
-                  <span class="platform-badge" style="--platform-color:#5A4FCF;">
+                <div class="comment-body">
+                  <div class="comment-text">{{ r.text }}</div>
+                </div>
+                <div class="comment-footer-row">
+                  <span class="platform-badge platform-badge-sm" style="--platform-color:var(--accent);">
                     <span class="platform-badge-icon">🌐</span>
                     <span class="platform-badge-name">Website</span>
                   </span>
-                  {% if r.rating %}<span class="badge badge-neu">★ {{ r.rating }}</span>{% endif %}
-                </div>
-                <div class="comment-body">
-                  <div class="comment-text">{{ r.text }}</div>
-                  <div class="comment-meta">
-                    {% if p.name %}<span class="product-badge">{{ p.name }}</span>{% endif %}
-                    {% if r.author %}<span class="comment-author">{{ r.author }}</span>{% endif %}
-                    {% if r.date %}<span class="comment-timestamp">{{ r.date }}</span>{% endif %}
-                  </div>
+                  {% if r.rating %}<span class="badge badge-sm badge-neu">★ {{ r.rating }}</span>{% endif %}
+                  {% if p.name %}<span class="product-badge">{{ p.name }}</span>{% endif %}
+                  {% if r.author %}<span class="comment-author">{{ r.author }}</span>{% endif %}
+                  {% if r.date %}<span class="comment-timestamp">{{ r.date }}</span>{% endif %}
                 </div>
               </div>
             </div>
@@ -1797,27 +1845,40 @@
   {% macro comment_card(c) %}
   {%- set _pl = (c.platform | default('')) | lower -%}
   {%- set _picon = '▶' if 'you' in _pl else ('🔍' if 'goog' in _pl else ('👽' if 'reddit' in _pl else ('𝕏' if ('twit' in _pl or _pl == 'x') else ('📸' if 'insta' in _pl else ('🌐' if ('web' in _pl or 'site' in _pl) else '💬'))))) -%}
-  {%- set _pcolor = '#FF0000' if 'you' in _pl else ('#4285F4' if 'goog' in _pl else ('#FF4500' if 'reddit' in _pl else ('#000000' if ('twit' in _pl or _pl == 'x') else ('#E1306C' if 'insta' in _pl else ('#5A4FCF' if ('web' in _pl or 'site' in _pl) else '#7B746C'))))) -%}
+  {%- set _pcolor = '#FF0000' if 'you' in _pl else ('#4285F4' if 'goog' in _pl else ('#FF4500' if 'reddit' in _pl else ('#000000' if ('twit' in _pl or _pl == 'x') else ('#E1306C' if 'insta' in _pl else ('var(--accent)' if ('web' in _pl or 'site' in _pl) else 'var(--muted)'))))) -%}
+  {%- set _comment = c.comment | default('') -%}
+  {%- set _is_long = (_comment | length) > 220 -%}
+  {%- set _preview = (_comment[:220] ~ '…') if _is_long else _comment -%}
+  {%- set _product_label = c.product if (c.product and c.product != 'General') else 'General' -%}
   <div class="comment-card" data-sentiment="{{ c.sentiment | default('neutral') }}" data-platform="{{ c.platform | default('') }}">
     <div class="comment-sentiment-dot"
          style="background: {% if c.sentiment == 'positive' %}var(--positive){% elif c.sentiment == 'negative' %}var(--negative){% else %}var(--neutral){% endif %}">
     </div>
     <div class="comment-card-inner">
-      <div class="comment-top-row">
-        <span class="platform-badge" style="--platform-color:{{ _pcolor }};">
+      <div class="comment-body">
+        <div class="comment-text"
+             data-full="{{ _comment }}"
+             data-preview="{{ _preview }}"
+             data-expanded="false">{{ _preview }}</div>
+        {% if _is_long %}
+        <button type="button" class="read-more-btn" onclick="toggleCommentText(this)">Read More ▼</button>
+        {% endif %}
+      </div>
+      <div class="comment-footer-row">
+        <span class="platform-badge platform-badge-sm" style="--platform-color:{{ _pcolor }};">
           <span class="platform-badge-icon">{{ _picon }}</span>
           <span class="platform-badge-name">{{ c.platform | default("Unknown") }}</span>
         </span>
-        <span class="badge {% if c.sentiment == 'positive' %}badge-pos{% elif c.sentiment == 'negative' %}badge-neg{% else %}badge-neu{% endif %}">
+        <span class="badge badge-sm {% if c.sentiment == 'positive' %}badge-pos{% elif c.sentiment == 'negative' %}badge-neg{% else %}badge-neu{% endif %}">
           {{ c.sentiment | default("neutral") }}
         </span>
-      </div>
-      <div class="comment-body">
-        <div class="comment-text">{{ c.comment | default("") }}</div>
-        <div class="comment-meta">
-          {% if c.product and c.product != 'General' %}<span class="product-badge">{{ c.product }}</span>{% endif %}
+        <span class="product-badge">{{ _product_label }}</span>
+        <span class="comment-meta-right">
           {% if c.timestamp %}<span class="comment-timestamp">{{ c.timestamp }}</span>{% endif %}
-        </div>
+          <button type="button" class="copy-btn" onclick="copyCommentText(this)" title="Copy full comment">
+            <span class="copy-btn-icon"></span><span class="copy-btn-label">Copy</span>
+          </button>
+        </span>
       </div>
     </div>
   </div>
@@ -1870,11 +1931,12 @@
       {% else %}<div class="empty"><div class="empty-icon"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div><div>No comments collected yet for this platform — try running the analysis again later.</div></div>{% endif %}
     </div>
   </div>
-  {% if pdf_path %}
+  {% if pdf_path or comments_pdf_path %}
   <div class="card" style="margin-bottom:1.1rem;">
     <div class="section-title">Download Report</div>
     <div class="download-row">
-      <a class="dl-btn" href="/{{ pdf_path }}">↓ 📄 Download Analysis Report</a>
+      {% if pdf_path %}<a class="dl-btn" href="/{{ pdf_path }}">↓ 📄 Download Analysis Report</a>{% endif %}
+      {% if comments_pdf_path %}<a class="dl-btn" href="/{{ comments_pdf_path }}">↓ 💬 Download All Scraped Comments (PDF)</a>{% endif %}
     </div>
   </div>
   {% endif %}
@@ -1890,7 +1952,7 @@ if (sentimentCanvas) {
       labels: ['Positive', 'Negative', 'Neutral'],
       datasets: [{
         data: [{{ positive | default(0) }}, {{ negative | default(0) }}, {{ neutral | default(0) }}],
-        backgroundColor: ['#16a34a', '#dc2626', '#d97706'],
+        backgroundColor: ['#2E7D4F', '#B23B33', '#6B7280'],
         borderColor: '#ffffff',
         borderWidth: 3,
         hoverOffset: 4,
@@ -1901,7 +1963,7 @@ if (sentimentCanvas) {
       plugins: {
         legend: { display: false },
         tooltip: {
-          backgroundColor: '#111827',
+          backgroundColor: '#18170F',
           padding: 10,
           cornerRadius: 6,
         }
@@ -1925,6 +1987,83 @@ function showPlatformTab(platform, btn) {
   document.querySelectorAll('.platform-panel').forEach(p => {
     p.style.display = (p.dataset.platformPanel === platform) ? '' : 'none';
   });
+}
+
+function toggleSpecGrid(btn) {
+  var grid = btn.previousElementSibling;
+  if (!grid || !grid.classList.contains('spec-grid')) return;
+  var limit = parseInt(grid.dataset.limit, 10) || 6;
+  var expanded = btn.dataset.expanded === 'true';
+  Array.from(grid.children).forEach(function (el, idx) {
+    if (expanded) {
+      if (idx >= limit) el.classList.add('spec-hidden');
+    } else {
+      el.classList.remove('spec-hidden');
+    }
+  });
+  if (expanded) {
+    btn.textContent = btn.dataset.showText;
+    btn.dataset.expanded = 'false';
+  } else {
+    btn.textContent = 'Show less ▲';
+    btn.dataset.expanded = 'true';
+  }
+}
+
+function toggleCommentText(btn) {
+  var textEl = btn.previousElementSibling;
+  if (!textEl || !textEl.classList.contains('comment-text')) return;
+  var expanded = textEl.dataset.expanded === 'true';
+  if (expanded) {
+    textEl.textContent = textEl.dataset.preview;
+    textEl.dataset.expanded = 'false';
+    btn.textContent = 'Read More ▼';
+  } else {
+    textEl.textContent = textEl.dataset.full;
+    textEl.dataset.expanded = 'true';
+    btn.textContent = 'Read Less ▲';
+  }
+}
+
+function copyCommentText(btn) {
+  var body = btn.closest('.comment-body');
+  var textEl = body ? body.querySelector('.comment-text') : null;
+  var full = textEl ? textEl.dataset.full : '';
+  if (!full) return;
+
+  var onDone = function () { showCopyFeedback(btn); };
+
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(full).then(onDone, function () {
+      fallbackCopy(full, onDone);
+    });
+  } else {
+    fallbackCopy(full, onDone);
+  }
+}
+
+function fallbackCopy(text, onDone) {
+  var ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  try { document.execCommand('copy'); onDone(); } catch (e) { /* clipboard unavailable */ }
+  document.body.removeChild(ta);
+}
+
+function showCopyFeedback(btn) {
+  var label = btn.querySelector('.copy-btn-label');
+  if (!label) return;
+  var original = label.textContent;
+  label.textContent = 'Copied!';
+  btn.classList.add('copied');
+  setTimeout(function () {
+    label.textContent = original;
+    btn.classList.remove('copied');
+  }, 1400);
 }
 </script>
 </body>

@@ -16,6 +16,31 @@ This module contains everything that is NOT orchestration:
 Nothing here talks to the network directly except where explicitly noted -
 network I/O (httpx / Playwright) stays in product_discovery.py so this module
 can be unit tested with plain strings.
+
+Session notes (2026-07-31) - empty-product-URL bug
+    Root-caused via direct comparison against samsung.com/in's real product
+    pages (e.g. /in/tvs/oled-tv/s95f-65-inch-oled-4k-smart-tv-.../), which
+    don't contain the word "product" anywhere - the two fixes below address
+    the two separate places a URL could get lost:
+    - _looks_like_product_url(): broadened to also accept a "/buy/" suffix
+      and a long, hyphenated, digit-bearing final path segment (a real
+      model/SKU slug), on top of the original /products//shop//store/ etc.
+      patterns. Used both for confidence scoring and, previously, as a
+      hard gate for keeping a card's href at all.
+    - parse_html_product_cards(): a card's own href is no longer blanked
+      just for failing that positive match - only for matching the
+      _EXCLUDED_URL_PATTERNS (cart/login/policy/etc). A link found inside
+      a container already identified as a product card is decent evidence
+      on its own, on any site's URL scheme.
+    - _jsonld_node_to_product(): added a url fallback chain (node "url" ->
+      "@id" -> the Offer's own "url") instead of leaving it blank the
+      moment the Product node itself didn't carry one.
+    Also, while investigating: genuinely long official product names
+    (routine on electronics/appliance listings) were being rejected
+    outright by the length/word-count noise checks. is_noise_text()'s word
+    cutoff moved from 7 to 10, and _jsonld_node_to_product() now truncates
+    an overlong name instead of discarding the whole product, matching how
+    `description` was already handled.
 """
 
 from __future__ import annotations
@@ -251,9 +276,13 @@ def is_noise_text(text: str) -> bool:
         return True
     # Long sentence-like strings (ending in punctuation, many words) are
     # almost never a product name - they are usually page copy or an
-    # error/status message that leaked through.
+    # error/status message that leaked through. Raised from 7 to 10 words -
+    # confirmed on samsung.com/in that genuine model names ("Neo QLED 8K
+    # Mini LED Smart TV QN900F...") routinely run 8-10 words; the
+    # punctuation-ending check just below still catches real sentence-like
+    # copy regardless of word count.
     words = lower.split()
-    if len(words) > 7:
+    if len(words) > 10:
         return True
     if lower.endswith((".", "!", "?")) and len(words) > 4:
         return True
@@ -351,12 +380,23 @@ def _jsonld_node_to_product(node: Dict, page_url: str) -> Optional[Product]:
         return None
 
     name = str(node.get("name") or "").strip()
+    if name and len(name) > config.MAX_CANDIDATE_LEN:
+        # A verbose-but-genuine official product name (electronics/
+        # appliance listings routinely run past MAX_CANDIDATE_LEN - e.g.
+        # Samsung/Sony-style "65-inch Neo QLED 8K Mini LED Smart TV ...")
+        # shouldn't sink the whole product. Shorten it at a word boundary
+        # instead of rejecting outright - the length check exists to catch
+        # scraped junk, not a name that's simply descriptive. Uses a single
+        # "..." ellipsis char rather than three periods: three periods
+        # would make the shortened name *end in a period*, which trips the
+        # separate "ends in sentence punctuation" noise check right below.
+        budget = config.MAX_CANDIDATE_LEN - 1
+        head = name[:budget]
+        if " " in head:
+            head = head.rsplit(" ", 1)[0]
+        name = head.rstrip() + "\u2026"
     if not name or not is_valid_candidate_name(name):
         return None
-
-    url = node.get("url") or ""
-    if url:
-        url = urljoin(page_url, url)
 
     image = node.get("image")
     if isinstance(image, list):
@@ -371,7 +411,7 @@ def _jsonld_node_to_product(node: Dict, page_url: str) -> Optional[Product]:
     brand = str(brand or "")
 
     offers = node.get("offers")
-    price, availability = "", ""
+    price, availability, offer_url = "", "", ""
     if isinstance(offers, list):
         offers = offers[0] if offers else {}
     if isinstance(offers, dict):
@@ -380,6 +420,24 @@ def _jsonld_node_to_product(node: Dict, page_url: str) -> Optional[Product]:
         if price_val:
             price = f"{currency} {price_val}".strip()
         availability = str(offers.get("availability") or "").rsplit("/", 1)[-1]
+        offer_url = str(offers.get("url") or "")
+
+    # A Product node's own "url" is the best source, but some sites only
+    # put the URL on the wrapping ItemList entry (which never reaches this
+    # function - see _flatten_jsonld), or on the node's "@id", or on its
+    # Offer instead. Try each before giving up and leaving it blank - this
+    # is the JSON-LD-side mechanism ARCHITECTURE.md traced the empty-
+    # product-URL bug to (the HTML-card-side mechanism is handled in
+    # parse_html_product_cards above).
+    url = str(node.get("url") or "")
+    if not url:
+        node_id = str(node.get("@id") or "")
+        if node_id.startswith("http") or node_id.startswith("/"):
+            url = node_id
+    if not url:
+        url = offer_url
+    if url:
+        url = urljoin(page_url, url)
 
     description = str(node.get("description") or "").strip()
     if len(description) > 200:
@@ -451,6 +509,29 @@ _CARD_CLASS_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Some large brand sites don't put any of the words in
+# _PRODUCT_URL_PATTERNS anywhere in a product page's URL at all - confirmed
+# directly on samsung.com/in, whose real product pages look like
+# /in/tvs/oled-tv/s95f-65-inch-oled-4k-smart-tv-qa65s95faulxl/ or
+# /in/smartphones/galaxy-s26-ultra/buy/ (pure category/subcategory/model-
+# slug paths, no "product" keyword anywhere). This was the root cause the
+# empty-product-URL bug in ARCHITECTURE.md was originally traced to on a
+# Samsung page: _looks_like_product_url() said no, so a real link got
+# blanked (see parse_html_product_cards) and the confidence score missed
+# its +0.30 (see Product.score in this file... actually in
+# product_discovery.py). Two extra, still-conservative signals catch this
+# shape without loosening things enough to start matching ordinary
+# category/article pages:
+#   - the path ends in a dedicated "/buy/" step (this is exactly what
+#     Samsung uses for "buy this specific model")
+#   - the final path segment is a long, hyphenated, digit-bearing slug -
+#     a real model/SKU slug like "qa65s95faulxl...", not a short menu
+#     label like "oled-tv" or "help-me-choose" (both fail the length/digit
+#     check even though "help-me-choose" has two hyphens too)
+_PRODUCT_BUY_SUFFIX_RE = re.compile(r"/buy/?$", re.IGNORECASE)
+_MODEL_SLUG_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+){2,}$", re.IGNORECASE)
+_MIN_MODEL_SLUG_LEN = 12
+
 
 def _looks_like_product_url(url: str) -> bool:
     if not url:
@@ -458,7 +539,102 @@ def _looks_like_product_url(url: str) -> bool:
     path = urlparse(url).path
     if _EXCLUDED_URL_PATTERNS.search(path):
         return False
-    return bool(_PRODUCT_URL_PATTERNS.search(path))
+    if _PRODUCT_URL_PATTERNS.search(path):
+        return True
+    if _PRODUCT_BUY_SUFFIX_RE.search(path):
+        return True
+    last_segment = path.rstrip("/").rsplit("/", 1)[-1]
+    return bool(
+        len(last_segment) >= _MIN_MODEL_SLUG_LEN
+        and any(ch.isdigit() for ch in last_segment)
+        and _MODEL_SLUG_RE.match(last_segment)
+    )
+
+
+_PLACEHOLDER_IMG_RE = re.compile(
+    r"placeholder|lazy[-_]?load|blank\.(gif|png|jpg)|spacer\.(gif|png)|"
+    r"loading\.(gif|svg|png)|1x1\.(gif|png)|no[-_]?image|"
+    r"loader[-_.]|[-_.]loader|spinner|skeleton",
+    re.IGNORECASE,
+)
+
+
+def _first_srcset_candidate(srcset: str) -> str:
+    """Pull the first URL out of a `srcset`/`data-srcset` value.
+
+    Entries are comma-separated ("img1.jpg 1x, img2.jpg 2x"), not
+    space-separated - splitting on a bare space (the previous approach)
+    could return a truncated fragment whenever a URL itself contained no
+    space before its width/density descriptor.
+    """
+    if not srcset:
+        return ""
+    first_entry = srcset.split(",")[0].strip()
+    return first_entry.split(" ")[0].strip() if first_entry else ""
+
+
+def _real_photo_src(img_tag) -> str:
+    """Pick the URL most likely to be the actual product photo.
+
+    Many storefronts (this is what was happening on boAt's gifting/bulk
+    catalogue pages) lazy-load real photos: the plain `src` attribute holds
+    a shared low-res placeholder or loading spinner until JS swaps in the
+    real image from `data-src`/`data-srcset`/`srcset` once the card
+    scrolls into view. Since this parser only ever sees the static HTML (no
+    JS runs), checking `src` first - the previous behaviour - meant the
+    scraper was frequently capturing that shared placeholder instead of the
+    per-product photo. That shared placeholder then either got filtered out
+    by select_products.html's reuse-limit (the same URL appears on dozens of
+    cards) or its minimum-size check (placeholders are tiny) - which is why
+    so many otherwise-legitimate products were still falling back to the
+    monogram tile.
+    Lazy-load attributes are checked first now; a plain `src` is only
+    trusted if none of them are present.
+    """
+    candidates = [
+        img_tag.get("data-src") or "",
+        _first_srcset_candidate(img_tag.get("data-srcset", "")),
+        _first_srcset_candidate(img_tag.get("srcset", "")),
+        img_tag.get("src") or "",
+    ]
+    for candidate in candidates:
+        candidate = (candidate or "").strip()
+        if not candidate or candidate.startswith("data:"):
+            continue
+        if _PLACEHOLDER_IMG_RE.search(candidate):
+            continue
+        return candidate
+    return ""
+
+
+_META_IMAGE_PROPS = ("og:image:secure_url", "og:image", "twitter:image", "twitter:image:src")
+
+
+def extract_meta_image(html: str) -> str:
+    """Pull a product photo from OpenGraph/Twitter <meta> tags on an
+    individual product *detail* page.
+
+    Listing/collection-page card markup is where most image-extraction
+    trouble happens (lazy-load attributes, or - as found on boAt's
+    promotional carousels - real photos injected entirely client-side by a
+    JS widget with no usable attribute in static HTML at all). A product's
+    own detail page is a much steadier source of truth: og:image/
+    twitter:image are near-universal on ecommerce platforms (Shopify,
+    WooCommerce, Magento, etc.) and are rendered server-side, so a plain
+    httpx fetch sees them with no JS required. This is used as a
+    last-resort fallback (see _enrich_missing_images in
+    product_discovery.py) when a listing card yields no image at all.
+    """
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, "html.parser")
+    for prop in _META_IMAGE_PROPS:
+        tag = soup.find("meta", attrs={"property": prop}) or soup.find("meta", attrs={"name": prop})
+        if tag is not None:
+            content = (tag.get("content") or "").strip()
+            if content and not content.startswith("data:"):
+                return content
+    return ""
 
 
 def parse_html_product_cards(html: str, page_url: str, category: str = "") -> List[Product]:
@@ -523,17 +699,24 @@ def parse_html_product_cards(html: str, page_url: str, category: str = "") -> Li
         if not href and not container.find("img"):
             # No link and no image at all - too weak a signal, discard.
             return
-        if href and not _looks_like_product_url(href):
-            # Has a link but it clearly points somewhere non-product (e.g. a
-            # "Shop Men" banner linking to a category, not a product).
+        if href and _EXCLUDED_URL_PATTERNS.search(urlparse(href).path):
+            # Confidently NOT a product (cart/login/policy/etc. - the
+            # classic case is a "Shop Men" banner linking to a category).
+            # Safe to drop.
             href = ""
+        # Deliberately NOT requiring a *positive* match against
+        # _looks_like_product_url() here. This container was already
+        # identified as a product card by its own class/structure - a
+        # same-origin link found inside it is decent evidence on its own,
+        # even on a site whose URLs don't happen to match the narrower
+        # regex (see _looks_like_product_url's comment re: samsung.com/in).
+        # Requiring that positive match here was the second mechanism
+        # behind the empty-product-URL bug in ARCHITECTURE.md.
 
         img_tag = container.find("img")
         image = ""
         if img_tag is not None:
-            image = img_tag.get("src") or img_tag.get("data-src") or img_tag.get("data-srcset", "").split(" ")[0]
-            if image:
-                image = urljoin(page_url, image)
+            image = urljoin(page_url, _real_photo_src(img_tag)) if _real_photo_src(img_tag) else ""
 
         price_text = ""
         price_el = container.find(class_=re.compile(r"price", re.IGNORECASE))

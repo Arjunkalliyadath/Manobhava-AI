@@ -6,231 +6,261 @@
   <title>Select Products — ManobhavaAI</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <!--
+    Same two-typeface system as index.html: Space Grotesk carries headlines
+    and the wordmark, Inter carries everything functional (labels, body,
+    buttons, form fields). Kept identical on purpose so moving from the
+    landing page into product selection doesn't feel like a different app —
+    both pages, plus dashboard.html, now also share one token file
+    (/static/style.css) for the same reason.
+  -->
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-    :root {
-      --bg:        #F7F2E9;
-      --surface:   #FFFDF8;
-      --border:    #E8DDCF;
-      --primary:   #5A4FCF;
-      --primary-d: #4a40b0;
-      --primary-l: rgba(90,79,207,0.10);
-      --text:      #24211D;
-      --muted:     #7B746C;
-      --dark:      #1B1B1B;
-    }
+    /* Design tokens now come from the shared /static/style.css linked
+       above (--bg, --ink, --muted, --mark, --positive, etc.) — this page
+       previously defined its own --positive:#4B5F45 specifically chosen
+       to sit next to --mark without competing; the shared --positive is
+       the same idea carried through to every page instead of one page
+       only. */
 
     html { scroll-behavior: smooth; }
     body {
       min-height: 100vh;
       background: var(--bg);
-      color: var(--text);
-      font-family: 'Poppins', -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--ink);
+      font-family: var(--font-body);
       font-size: 15px;
       padding-bottom: 6.5rem; /* room for sticky footer */
     }
 
-    .shell { max-width: 1160px; margin: 0 auto; padding: 0 1.5rem 2rem; }
+    .shell { max-width: 1160px; margin: 0 auto; padding: 0 1.5rem; }
 
-    /* --- Nav (matches dashboard) --- */
+    /* --- Nav: identical to index.html --- */
     nav {
       display: flex; align-items: center; justify-content: space-between;
-      background: rgba(255,253,248,.72);
-      backdrop-filter: blur(10px);
-      border: 1px solid var(--border);
-      border-radius: 22px;
-      padding: 1rem 1.2rem;
-      margin: 1.2rem 0 2rem;
-      box-shadow: 0 12px 30px rgba(65,48,28,.06);
+      padding: 1.5rem 0;
+      border-bottom: 1px solid var(--border);
     }
-    .brand { display: flex; align-items: center; gap: .6rem; text-decoration: none; color: inherit; }
-    .brand-icon {
-      width: 32px; height: 32px;
-      background: linear-gradient(135deg, var(--dark), #3A342E);
-      box-shadow: 0 8px 18px rgba(0,0,0,.16);
-      border-radius: 10px;
-      display: grid; place-items: center;
-      color: #fff; font-size: .6rem; font-weight: 800; letter-spacing: -.5px;
+    .brand {
+      display: flex; align-items: baseline; gap: .1rem;
+      text-decoration: none; color: inherit;
+      font-family: var(--font-body);
+      font-weight: 700; font-size: .92rem;
+      letter-spacing: .16em;
+      text-transform: uppercase;
     }
-    .brand-name { font-weight: 800; font-size: 1rem; letter-spacing: -.01em; }
-    .brand-name .accent { color: var(--primary); }
+    .brand .dot {
+      color: var(--mark);
+      font-size: 1.4em;
+      line-height: 0;
+      position: relative;
+      top: .08em;
+      margin: 0 .05em;
+    }
+    .brand .lt { color: var(--muted); font-weight: 500; }
     .nav-back {
-      display: flex; align-items: center; gap: .4rem;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 999px;
-      padding: .45rem .9rem;
-      font-size: .82rem; font-weight: 500; color: var(--muted);
-      text-decoration: none; transition: color .15s, border-color .15s;
+      display: flex; align-items: center; gap: .35rem;
+      font-size: .72rem; font-weight: 600; letter-spacing: .1em; text-transform: uppercase;
+      color: var(--muted); text-decoration: none;
+      transition: color .15s;
     }
-    .nav-back:hover { color: var(--primary); border-color: var(--primary); }
+    .nav-back:hover { color: var(--mark); }
 
-    /* --- Header (matches dashboard's dark company-header) --- */
-    .page-header {
-      background: var(--dark); color: #fff;
-      border-radius: 28px; padding: 1.6rem 1.8rem;
-      box-shadow: 0 18px 38px rgba(27,27,27,.16);
-      margin-bottom: 1.5rem;
+    /* --- Listing header: quiet editorial block, not a dark card --- */
+    .listing-header {
+      padding: 3.25rem 0 2.25rem;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 2.25rem;
     }
-    .page-eyebrow { font-size: .7rem; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: #F8E08E; margin-bottom: .35rem; }
-    .page-title { font-size: clamp(1.3rem, 2.6vw, 1.85rem); font-weight: 700; letter-spacing: -.02em; margin-bottom: .55rem; }
-    .page-stats { font-size: .95rem; font-weight: 600; color: #fff; margin-bottom: .3rem; }
-    .page-stats strong { color: #F8E08E; font-weight: 800; }
-    .page-subtext { font-size: .85rem; color: rgba(255,255,255,.68); }
+    .eyebrow {
+      font-size: .72rem; font-weight: 600; letter-spacing: .22em; text-transform: uppercase;
+      color: var(--muted); margin-bottom: 1rem;
+    }
+    .listing-title {
+      font-family: var(--font-display);
+      font-optical-sizing: auto;
+      font-size: clamp(1.9rem, 4.2vw, 2.85rem);
+      font-weight: 500; letter-spacing: -.01em; line-height: 1.14;
+      margin-bottom: .8rem;
+    }
+    .listing-title em { font-style: italic; color: var(--mark); font-weight: 500; }
+    .listing-meta { color: var(--muted); font-size: .95rem; }
+    .listing-meta strong { color: var(--ink); font-weight: 600; }
 
-    /* --- Search + card container --- */
-    .card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 22px;
-      padding: 1.35rem 1.5rem;
-      box-shadow: 0 14px 32px rgba(65,48,28,.07);
+    /* --- Search + filter row: instrument style, no boxed "card" --- */
+    .filter-row {
+      display: flex; align-items: flex-end; gap: 2rem; flex-wrap: wrap;
+      margin-bottom: .85rem;
     }
-    .search-row { display: flex; align-items: center; gap: .9rem; margin-bottom: .6rem; flex-wrap: wrap; }
+    .search-field { flex: 1; min-width: 240px; max-width: 460px; }
+    .field-label {
+      display: block; font-size: .68rem; font-weight: 600; letter-spacing: .12em; text-transform: uppercase;
+      color: var(--muted-2); margin-bottom: .55rem;
+    }
     .search-box {
-      flex: 1; min-width: 220px; max-width: 420px;
-      padding: .7rem 1rem; border: 1px solid var(--border); border-radius: 12px;
-      font-size: .9rem; font-family: inherit; background: var(--bg); color: var(--text);
-      transition: border-color .15s, box-shadow .15s;
+      width: 100%;
+      border: none; border-bottom: 1.5px solid var(--ink); background: transparent;
+      padding: .35rem .1rem .6rem;
+      font-family: var(--font-body); font-size: .95rem; color: var(--ink);
+      outline: none;
     }
-    .search-box:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-l); }
+    .search-box::placeholder { color: var(--muted-2); }
+    .search-box:focus { border-bottom-color: var(--mark); }
 
     .toggle-selected-only {
-      display: flex; align-items: center; gap: .45rem;
-      font-size: .82rem; font-weight: 500; color: var(--muted);
-      cursor: pointer; white-space: nowrap; user-select: none;
+      display: flex; align-items: center; gap: .5rem;
+      font-size: .72rem; font-weight: 600; letter-spacing: .1em; text-transform: uppercase;
+      color: var(--muted); cursor: pointer; user-select: none;
+      padding-bottom: .7rem;
     }
     .toggle-selected-only input {
-      width: 16px; height: 16px; accent-color: var(--primary); cursor: pointer;
+      width: 15px; height: 15px; accent-color: var(--mark); cursor: pointer;
     }
-    .toggle-selected-only:hover { color: var(--text); }
+    .toggle-selected-only:hover { color: var(--ink); }
 
-    .showing-row { font-size: .8rem; color: var(--muted); margin: 0 0 1.1rem; }
-    .showing-row strong { color: var(--text); font-weight: 700; }
+    .showing-row {
+      font-size: .78rem; color: var(--muted-2); letter-spacing: .02em;
+      margin: 0 0 1.6rem;
+    }
+    .showing-row strong { color: var(--muted); font-weight: 600; }
 
-    /* --- Product cards --- */
+    /* --- Product grid: plain tiles, no heavy shadow/pill chrome --- */
     .product-list {
-      max-height: 58vh; overflow-y: auto;
-      display: grid; gap: .9rem;
-      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-      padding: .2rem .2rem .3rem;
+      max-height: none; overflow-y: visible;
+      display: grid; gap: 1px;
+      grid-template-columns: repeat(auto-fill, minmax(165px, 1fr));
+      background: var(--border);
+      border: 1px solid var(--border);
     }
     .product-card {
       position: relative;
-      display: flex; gap: .8rem; align-items: flex-start;
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 16px;
-      padding: 1rem 1.1rem;
+      display: flex; flex-direction: column; gap: .65rem;
+      background: var(--surface);
+      padding: .85rem .85rem .95rem;
       cursor: pointer;
-      transition: border-color .15s, box-shadow .15s, background .15s, transform .15s;
+      transition: background .15s;
     }
-    .product-card:hover {
-      border-color: var(--primary);
-      box-shadow: 0 10px 22px rgba(65,48,28,.08);
-      transform: translateY(-1px);
-    }
-    .product-card.selected {
-      background: var(--primary-l);
-      border-color: var(--primary);
-      box-shadow: 0 0 0 3px rgba(90,79,207,.16), 0 12px 24px rgba(90,79,207,.16);
-    }
+    .product-card:hover { background: var(--paper); }
+    .product-card.selected { background: var(--accent-soft); }
     .product-card.disabled {
-      opacity: .45;
+      opacity: .4;
       cursor: not-allowed;
-      transform: none;
-      box-shadow: none;
     }
-    .selected-badge {
-      position: absolute; top: -8px; right: -8px;
-      width: 22px; height: 22px; border-radius: 50%;
-      background: var(--primary); color: #fff;
-      align-items: center; justify-content: center;
-      font-size: .68rem; font-weight: 700;
-      box-shadow: 0 4px 10px rgba(90,79,207,.4);
-      display: none;
-      z-index: 1;
+
+    .product-top-row { display: flex; align-items: flex-start; justify-content: space-between; gap: .5rem; }
+
+    .product-thumb {
+      width: 40px; height: 40px; flex-shrink: 0;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      display: flex; align-items: center; justify-content: center;
+      overflow: hidden;
     }
-    .product-card.selected .selected-badge { display: flex; }
+    .product-thumb img { width: 100%; height: 100%; object-fit: contain; }
+    .product-thumb .thumb-fallback {
+      width: 22px; height: 22px;
+      border: 1px solid var(--hairline);
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-family: var(--font-display);
+      font-style: italic; font-size: .65rem; color: var(--muted-2);
+    }
+
+    .top-row-controls { display: flex; align-items: center; gap: .4rem; flex-shrink: 0; }
     .product-checkbox {
-      margin-top: 3px;
-      width: 18px; height: 18px;
-      accent-color: var(--primary);
+      width: 15px; height: 15px;
+      accent-color: var(--mark);
       cursor: pointer;
       flex-shrink: 0;
     }
     .product-card.disabled .product-checkbox { cursor: not-allowed; }
-    .product-info { flex: 1; min-width: 0; }
-    .product-name { font-weight: 600; font-size: .92rem; line-height: 1.35; word-break: break-word; }
-    .product-category {
-      display: inline-block; margin-top: .35rem;
-      font-size: .7rem; font-weight: 600; letter-spacing: .03em; text-transform: uppercase;
-      color: var(--primary); background: var(--primary-l);
-      border-radius: 999px; padding: .12rem .55rem;
+
+    .selected-badge {
+      width: 17px; height: 17px; border-radius: 50%;
+      background: var(--mark); color: #fff;
+      align-items: center; justify-content: center;
+      font-size: .58rem; font-weight: 700;
+      display: none;
+      flex-shrink: 0;
     }
-    .empty { text-align: center; padding: 3rem; color: var(--muted); font-size: .9rem; grid-column: 1 / -1; }
+    .product-card.selected .selected-badge { display: flex; }
+
+    .product-info { flex: 1; min-width: 0; }
+    .product-name { font-weight: 600; font-size: .82rem; line-height: 1.35; word-break: break-word; }
+    .product-category {
+      display: block; margin-top: .35rem;
+      font-size: .6rem; font-weight: 600; letter-spacing: .08em; text-transform: uppercase;
+      color: var(--muted);
+    }
+    .empty { text-align: center; padding: 3.5rem 1rem; color: var(--muted); font-size: .9rem; grid-column: 1 / -1; background: var(--surface); }
 
     /* --- Sticky footer --- */
     .footer {
       position: fixed; left: 0; right: 0; bottom: 0;
-      background: rgba(255,253,248,.9);
+      background: rgba(246,242,234,.94);
       backdrop-filter: blur(10px);
       border-top: 1px solid var(--border);
-      box-shadow: 0 -8px 24px rgba(65,48,28,.06);
       padding: 1rem 1.5rem;
-      display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap;
+      display: flex; justify-content: center; align-items: center;
       z-index: 20;
     }
-    .footer-left { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; }
-    .selected-count { font-size: .9rem; font-weight: 500; color: var(--text); }
-    .selected-count strong { color: var(--primary); font-weight: 700; }
+    .footer-inner {
+      width: 100%; max-width: 1160px;
+      display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap;
+    }
+    .footer-left { display: flex; align-items: center; gap: 1.4rem; flex-wrap: wrap; }
+    .selected-count { font-size: .85rem; font-weight: 500; color: var(--muted); }
+    .selected-count strong { color: var(--ink); font-weight: 700; }
 
     .btn {
-      padding: .7rem 1.4rem; border-radius: 999px; font-weight: 600; font-size: .88rem;
-      cursor: pointer; transition: all .15s; font-family: inherit; border: none;
+      padding: .8rem 1.6rem; border-radius: 3px; font-weight: 600; font-size: .78rem;
+      letter-spacing: .1em; text-transform: uppercase;
+      cursor: pointer; transition: background .15s, transform .1s, color .15s; font-family: inherit; border: none;
     }
-    .btn-primary { background: var(--primary); color: #fff; box-shadow: 0 8px 18px rgba(90,79,207,.28); }
-    .btn-primary:hover { background: var(--primary-d); }
-    .btn-secondary { background: var(--surface); border: 1px solid var(--border); color: var(--muted); }
-    .btn-secondary:hover { border-color: var(--primary); color: var(--primary); }
+    .btn-primary { background: var(--ink); color: var(--bg); }
+    .btn-primary:hover { background: var(--mark); }
+    .btn-primary:active { transform: scale(.97); }
+    .btn-secondary { background: transparent; border: none; color: var(--muted); text-decoration: underline; text-underline-offset: 3px; padding: .8rem .2rem; letter-spacing: .04em; text-transform: none; font-size: .82rem; font-weight: 500; }
+    .btn-secondary:hover { color: var(--mark); }
 
     /* --- Validation modal --- */
     .modal-overlay {
-      position: fixed; inset: 0; background: rgba(27,27,27,.45);
+      position: fixed; inset: 0; background: rgba(23,20,15,.5);
       display: flex; align-items: center; justify-content: center;
       opacity: 0; pointer-events: none; transition: opacity .15s;
       z-index: 50; padding: 1.5rem;
     }
     .modal-overlay.open { opacity: 1; pointer-events: auto; }
     .modal-box {
-      background: var(--surface); border-radius: 22px; padding: 1.75rem;
+      background: var(--surface); border: 1px solid var(--border);
+      padding: 2rem 1.85rem;
       max-width: 340px; width: 100%; text-align: center;
-      box-shadow: 0 24px 48px rgba(0,0,0,.2);
       transform: translateY(6px); transition: transform .15s;
     }
     .modal-overlay.open .modal-box { transform: translateY(0); }
-    .modal-icon { font-size: 1.8rem; margin-bottom: .6rem; }
-    .modal-title { font-weight: 700; font-size: 1.05rem; margin-bottom: .4rem; }
-    .modal-message { font-size: .88rem; color: var(--muted); line-height: 1.5; margin-bottom: 1.2rem; }
+    .modal-icon { font-family: var(--font-display); font-style: italic; font-size: 1.6rem; color: var(--mark); margin-bottom: .7rem; }
+    .modal-title { font-weight: 700; font-size: 1rem; margin-bottom: .5rem; letter-spacing: -.005em; }
+    .modal-message { font-size: .85rem; color: var(--muted); line-height: 1.6; margin-bottom: 1.5rem; }
 
     @media (max-width: 640px) {
-      .footer { flex-direction: column; align-items: stretch; }
+      .footer-inner { flex-direction: column; align-items: stretch; }
       .footer-left { justify-content: space-between; }
+      .btn-primary { width: 100%; text-align: center; }
     }
 
     /* ============================================================
-       PHASE 2 — ANALYSIS-PHASE LOADING OVERLAY
-       Covers the work that happens inside POST /analyze_selected:
-       collecting reviews, running sentiment analysis, and building
-       the executive report — right up until the dashboard loads.
+       PHASE 2 — ANALYSIS-PHASE OVERLAY
+       Restyled to match the discovery-phase overlay on index.html:
+       one large serif line that crossfades between stages above a
+       thin progress rail, instead of a stacked spinner checklist.
        ============================================================ */
     .analysis-overlay {
       display: none;
       position: fixed; inset: 0; z-index: 60;
-      background: rgba(247,242,233,.97);
-      backdrop-filter: blur(6px);
+      background: var(--bg);
       align-items: center; justify-content: center;
       padding: 1.5rem;
       overflow-y: auto;
@@ -238,149 +268,175 @@
     .analysis-overlay.active { display: flex; }
     .analysis-card {
       width: 100%; max-width: 440px;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 22px;
-      padding: 2rem;
-      box-shadow: 0 20px 44px rgba(65,48,28,.1);
+      text-align: center;
     }
-    .analysis-title { font-size: 1.05rem; font-weight: 700; margin-bottom: .3rem; }
-    .analysis-subtitle { font-size: .82rem; color: var(--muted); margin-bottom: 1.75rem; }
+    .analysis-title-row { margin-bottom: 2.25rem; }
+    .analysis-eyebrow {
+      font-size: .68rem; font-weight: 600; letter-spacing: .2em; text-transform: uppercase;
+      color: var(--muted-2); margin-bottom: 1.4rem;
+    }
+    .analysis-title {
+      font-family: var(--font-body);
+      font-size: .92rem; font-weight: 600; color: var(--muted);
+    }
+    .analysis-title strong { color: var(--ink); }
+    .analysis-subtitle { font-size: .78rem; color: var(--muted-2); margin-top: .4rem; }
 
-    .stage-list { display: flex; flex-direction: column; gap: 1.1rem; margin-bottom: 1.75rem; }
-    .stage { display: flex; align-items: center; gap: .8rem; }
-    .stage-indicator {
-      position: relative;
-      width: 22px; height: 22px; flex-shrink: 0;
-      border-radius: 50%;
-      border: 2px solid var(--border);
-      display: grid; place-items: center;
+    /* One line, large, changes in place — mirrors .stage-display on index.html */
+    .stage-display { position: relative; min-height: 2.6em; margin-bottom: 1.75rem; }
+    .stage-list { display: contents; }
+    .stage {
+      font-family: var(--font-display);
+      font-size: clamp(1.2rem, 3vw, 1.5rem);
+      font-weight: 500; letter-spacing: -.005em; line-height: 1.3;
+      color: var(--muted-2);
+      position: absolute; inset: 0;
+      display: flex; align-items: center; justify-content: center; gap: .5rem;
+      opacity: 0; transform: translateY(6px);
+      transition: opacity .35s ease, transform .35s ease;
+      pointer-events: none;
     }
-    .stage-label { font-size: .88rem; font-weight: 500; color: var(--muted); transition: color .2s; }
-    .stage.active .stage-indicator {
-      border-color: var(--border); border-top-color: var(--primary);
-      animation: stage-spin .8s linear infinite;
+    .stage.active { color: var(--ink); opacity: 1; transform: translateY(0); pointer-events: auto; }
+    .stage.done { opacity: 0; }
+    /* stage-indicator is no longer a spinner circle — kept as an empty,
+       invisible element only so the JS that references it never errors */
+    .stage-indicator { display: none; }
+    .stage-label { display: inline; }
+
+    .progress-rail {
+      position: relative; height: 1px; background: var(--border);
+      overflow: hidden; border-radius: 1px; margin-bottom: 2rem;
     }
-    .stage.active .stage-label { color: var(--text); font-weight: 600; }
-    .stage.done .stage-indicator { border-color: var(--positive); background: var(--positive); animation: none; }
-    .stage.done .stage-indicator::after { content: "✓"; color: #fff; font-size: .68rem; font-weight: 700; }
-    .stage.done .stage-label { color: var(--text); }
-    @keyframes stage-spin { to { transform: rotate(360deg); } }
+    .progress-fill {
+      position: absolute; top: 0; left: 0; bottom: 0;
+      width: 8%; background: var(--mark);
+      transition: width .5s ease;
+    }
 
     .live-details {
       display: flex; justify-content: center; gap: .75rem;
-      padding: 1rem; background: var(--bg); border: 1px solid var(--border); border-radius: 14px;
-      margin-bottom: 1.5rem;
+      margin-bottom: 1.75rem;
     }
     .live-detail { text-align: center; }
-    .live-detail-value { font-size: 1.15rem; font-weight: 800; color: var(--primary); }
-    .live-detail-label { font-size: .66rem; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; margin-top: .15rem; }
+    .live-detail-value {
+      font-family: var(--font-display); font-size: 1.5rem; font-weight: 500; color: var(--ink);
+    }
+    .live-detail-label {
+      font-size: .64rem; color: var(--muted-2); text-transform: uppercase; letter-spacing: .1em; margin-top: .2rem;
+    }
 
     .analysis-log-toggle {
-      display: flex; align-items: center; justify-content: space-between; gap: .5rem;
+      display: flex; align-items: center; justify-content: center; gap: .5rem;
       width: 100%; background: none; border: none; cursor: pointer;
-      font-family: inherit; font-size: .82rem; font-weight: 600; color: var(--muted);
-      padding: .4rem 0;
+      font-family: inherit; font-size: .72rem; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--muted-2);
+      padding: .6rem 0; border-top: 1px solid var(--border);
     }
-    .analysis-log-toggle:hover { color: var(--primary); }
-    .analysis-log-toggle .chevron { transition: transform .15s; font-size: .9rem; }
+    .analysis-log-toggle:hover { color: var(--mark); }
+    .analysis-log-toggle .chevron { transition: transform .15s; font-size: .85rem; }
     .analysis-log-toggle.open .chevron { transform: rotate(180deg); }
     .analysis-log {
       display: none;
       list-style: none;
-      font-size: .78rem;
-      padding: .6rem 0 0;
-      flex-direction: column; gap: .45rem;
-      max-height: 160px; overflow-y: auto;
+      font-size: .78rem; color: var(--muted);
+      padding: 1rem 0 0;
+      flex-direction: column; gap: .55rem;
+      max-height: 150px; overflow-y: auto;
+      text-align: left;
     }
     .analysis-log.open { display: flex; }
-    .analysis-log li { display: flex; align-items: center; gap: .5rem; }
-    .analysis-log li.log-done { color: var(--muted); }
-    .analysis-log li.log-done::before { content: "✓"; color: var(--positive); font-weight: 700; }
+    .analysis-log li { display: flex; align-items: center; gap: .55rem; }
+    .analysis-log li.log-done::before { content: "—"; color: var(--mark); }
 
-    /* --- Completion screen --- */
+    /* --- Completion state --- */
     .completion-card { text-align: center; display: none; }
     .completion-card.active { display: block; }
     .completion-check {
-      width: 50px; height: 50px; border-radius: 50%;
-      background: var(--positive); color: #fff;
-      display: grid; place-items: center;
-      font-size: 1.25rem; font-weight: 700;
-      margin: 0 auto 1rem;
+      font-family: var(--font-display); font-style: italic;
+      font-size: 2rem; color: var(--mark);
+      margin-bottom: 1.1rem;
     }
-    .completion-title { font-size: 1.1rem; font-weight: 700; margin-bottom: 1.25rem; }
-    .completion-stats { display: flex; justify-content: center; margin-bottom: 1.25rem; }
-    .completion-note { font-size: .8rem; color: var(--muted); }
+    .completion-title {
+      font-family: var(--font-display);
+      font-size: 1.4rem; font-weight: 500; margin-bottom: 1.75rem;
+    }
+    .completion-stats { display: flex; justify-content: center; margin-bottom: 1.5rem; }
+    .completion-note { font-size: .74rem; letter-spacing: .08em; text-transform: uppercase; color: var(--muted-2); }
   </style>
 </head>
 <body>
 <div class="shell">
 
   <nav>
-    <a class="brand" href="/">
-      <div class="brand-icon">M-AI</div>
-      <div class="brand-name">Manobhava<span class="accent">AI</span></div>
-    </a>
+    <a class="brand" href="/">MANOBHAVA<span class="dot">·</span><span class="lt">AI</span></a>
     <a class="nav-back" href="/">← New search</a>
   </nav>
 
-  <div class="page-header">
-    <div class="page-eyebrow">Select Products</div>
-    <div class="page-title">{{ (company.company_name | default("Company")) | title }}</div>
-    <div class="page-stats"><strong>{{ products|length }}</strong> Products Found</div>
-    <div class="page-subtext">Select up to 5 products for analysis</div>
+  <div class="listing-header">
+    <div class="eyebrow">Select Products</div>
+    <h1 class="listing-title">{{ (company.company_name | default("Company")) | title }}</h1>
+    <p class="listing-meta"><strong>{{ products|length }}</strong> products found — choose up to <strong>{{ max_selectable }}</strong> to analyze.</p>
   </div>
 
-  <div class="card">
-    <div class="search-row">
-      <input type="text" id="searchInput" class="search-box" placeholder="Search products (e.g. Sony, Oriveti)..." autocomplete="off">
-      <label class="toggle-selected-only">
-        <input type="checkbox" id="selectedOnlyToggle">
-        <span>Show Selected Only</span>
-      </label>
+  <div class="filter-row">
+    <div class="search-field">
+      <label class="field-label" for="searchInput">Search</label>
+      <input type="text" id="searchInput" class="search-box" placeholder="Try Sony, Oriveti..." autocomplete="off">
     </div>
+    <label class="toggle-selected-only">
+      <input type="checkbox" id="selectedOnlyToggle">
+      <span>Selected only</span>
+    </label>
+  </div>
 
-    <div class="showing-row" id="showingRow">
-      Showing <strong id="showingCount">{{ products|length }}</strong> of <strong>{{ products|length }}</strong> products
-    </div>
+  <div class="showing-row" id="showingRow">
+    Showing <strong id="showingCount">{{ products|length }}</strong> of <strong>{{ products|length }}</strong> products
+  </div>
 
-    <div class="product-list" id="productList">
-      {% for product in products %}
-      <label class="product-card" data-name="{{ product.name|lower }}" data-product="{{ product.json }}">
-        <span class="selected-badge">✓</span>
-        <input type="checkbox" class="product-checkbox" form="analyzeForm">
-        <div class="product-info">
-          <div class="product-name">{{ product.name }}</div>
-          {% if product.category %}
-          <div class="product-category">{{ product.category }}</div>
-          {% endif %}
+  <div class="product-list" id="productList">
+    {% for product in products %}
+    <label class="product-card" data-name="{{ product.name|lower }}" data-product="{{ product.json }}">
+      <div class="product-top-row">
+        <div class="product-thumb" data-image="{{ product.image }}">
+          <span class="thumb-fallback">{{ product.name[:1]|upper }}</span>
         </div>
-      </label>
-      {% else %}
-      <div class="empty">No products found.</div>
-      {% endfor %}
-      {% if products %}
-      <div class="empty" id="noMatchMessage" style="display:none;">No matching products found.</div>
-      {% endif %}
-    </div>
+        <div class="top-row-controls">
+          <span class="selected-badge">✓</span>
+          <input type="checkbox" class="product-checkbox" form="analyzeForm">
+        </div>
+      </div>
+      <div class="product-info">
+        <div class="product-name">{{ product.name }}</div>
+        {% if product.category %}
+        <span class="product-category">{{ product.category }}</span>
+        {% endif %}
+      </div>
+    </label>
+    {% else %}
+    <div class="empty">No products found.</div>
+    {% endfor %}
+    {% if products %}
+    <div class="empty" id="noMatchMessage" style="display:none;">No matching products found.</div>
+    {% endif %}
   </div>
 </div>
 
 <div class="footer">
-  <div class="footer-left">
-    <span class="selected-count" id="selectedCount">Selected: <strong>0</strong> / 5</span>
-    <button type="button" class="btn btn-secondary" id="clearAllBtn">Clear All</button>
+  <div class="footer-inner">
+    <div class="footer-left">
+      <span class="selected-count" id="selectedCount">Selected: <strong>0</strong> / 3</span>
+      <button type="button" class="btn btn-secondary" id="clearAllBtn">Clear all</button>
+    </div>
+    <form id="analyzeForm" method="POST" action="/analyze_selected" style="margin: 0;">
+      <input type="hidden" name="website" value="{{ website }}">
+      <input type="hidden" name="selected_products" id="selectedProductsInput" value="[]">
+      <button type="submit" class="btn btn-primary" id="analyzeBtn">Analyze 0 Products</button>
+    </form>
   </div>
-  <form id="analyzeForm" method="POST" action="/analyze_selected" style="margin: 0;">
-    <input type="hidden" name="website" value="{{ website }}">
-    <input type="hidden" name="selected_products" id="selectedProductsInput" value="[]">
-    <button type="submit" class="btn btn-primary" id="analyzeBtn">Analyze 0 Products</button>
-  </form>
 </div>
 
 <div class="modal-overlay" id="modalOverlay">
   <div class="modal-box">
-    <div class="modal-icon">⚠️</div>
+    <div class="modal-icon">·</div>
     <div class="modal-title">Hold on</div>
     <div class="modal-message">Please select at least one product before analyzing.</div>
     <button type="button" class="btn btn-primary" id="modalCloseBtn">Got it</button>
@@ -392,23 +448,28 @@
 
     <!-- Progress state -->
     <div id="progressState">
-      <div class="analysis-title">Analyzing <span id="analysisProductCount">0</span> products</div>
-      <div class="analysis-subtitle">This can take a minute or two — feel free to wait here.</div>
+      <div class="analysis-title-row">
+        <div class="analysis-eyebrow">Analyzing</div>
+        <div class="analysis-title">Reviewing <strong><span id="analysisProductCount">0</span> products</strong></div>
+        <div class="analysis-subtitle">This can take a minute or two — feel free to wait here.</div>
+      </div>
 
-      <div class="stage-list" id="analysisStageList">
+      <div class="stage-display" id="analysisStageList">
         <div class="stage" data-stage="0">
           <span class="stage-indicator"></span>
-          <span class="stage-label">Collecting Reviews</span>
+          <span class="stage-label">Collecting reviews</span>
         </div>
         <div class="stage" data-stage="1">
           <span class="stage-indicator"></span>
-          <span class="stage-label">Running AI Sentiment Analysis</span>
+          <span class="stage-label">Running AI sentiment analysis</span>
         </div>
         <div class="stage" data-stage="2">
           <span class="stage-indicator"></span>
-          <span class="stage-label">Generating Executive Report</span>
+          <span class="stage-label">Generating executive report</span>
         </div>
       </div>
+
+      <div class="progress-rail"><div class="progress-fill" id="analysisProgressFill"></div></div>
 
       <!--
         LIVE DETAILS
@@ -428,7 +489,7 @@
       </div>
 
       <button type="button" class="analysis-log-toggle" id="logToggle">
-        <span>View Analysis Log</span>
+        <span>View analysis log</span>
         <span class="chevron">⌄</span>
       </button>
       <!--
@@ -444,11 +505,11 @@
     <!-- Completion state -->
     <div class="completion-card" id="completionCard">
       <div class="completion-check">✓</div>
-      <div class="completion-title">Analysis Complete</div>
+      <div class="completion-title">Analysis complete</div>
       <div class="completion-stats">
         <div class="live-detail">
           <div class="live-detail-value" id="finalProducts">0</div>
-          <div class="live-detail-label">Products Found</div>
+          <div class="live-detail-label">Products found</div>
         </div>
       </div>
       <div class="completion-note">Opening dashboard…</div>
@@ -459,7 +520,13 @@
 
 <script>
 (function () {
-  const MAX_SELECTED = 5;
+  // Rendered from config.MAX_SELECTABLE_PRODUCTS (via app.py) so this can
+  // never drift from the number shown in the page copy above or enforced
+  // server-side again — was hardcoded to 3 here (cut from 5: each selected
+  // product multiplies scraper work across every platform, so this is the
+  // main lever keeping even the extreme case under the 3-minute ceiling)
+  // while the copy above still said 5, which is the bug this fixes.
+  const MAX_SELECTED = {{ max_selectable }};
 
   const productList        = document.getElementById('productList');
   const checkboxes          = Array.from(document.querySelectorAll('.product-checkbox'));
@@ -476,6 +543,55 @@
   const modalCloseBtn       = document.getElementById('modalCloseBtn');
 
   const TOTAL_PRODUCTS = cards.length;
+
+  // --- Thumbnail loading -------------------------------------------------
+  // The scraper's `image` field isn't reliably a real product photo — it's
+  // whatever image tag it found on the listing page, which is sometimes a
+  // shared UI asset (a "% off" gifting badge, a star-rating icon) rather
+  // than a genuine per-SKU photo. Two independent signals catch that:
+  //   1. Keyword check — badge/icon URLs tend to say so (badge, icon,
+  //      percent, discount, offer, coupon, rating, star, sticker).
+  //   2. Heavy reuse — a handful of products legitimately sharing one photo
+  //      (e.g. two colourways of the same shot) is normal and shouldn't be
+  //      punished, but a URL reused across a large slice of the catalogue
+  //      is a generic site asset, not a photo. REUSE_LIMIT is deliberately
+  //      loose so real shared photos survive.
+  // Combined with a minimum-size check once loaded (real photos are large;
+  // icons tend to be small), this keeps genuine photos and quietly falls
+  // back to the monogram tile for everything else.
+  (function loadThumbnails() {
+    const BADGE_KEYWORDS = ['badge', 'icon', 'percent', 'discount', 'offer', 'coupon', 'rating', 'star', 'sticker', 'sale', 'banner'];
+    const REUSE_LIMIT = 4; // a URL used by more than this many products is treated as a generic asset
+
+    const thumbs = Array.from(document.querySelectorAll('.product-thumb[data-image]'));
+    const urlCounts = {};
+    for (const thumb of thumbs) {
+      const src = thumb.dataset.image;
+      if (!src) continue;
+      urlCounts[src] = (urlCounts[src] || 0) + 1;
+    }
+
+    function looksLikeBadge(src) {
+      const lower = src.toLowerCase();
+      return BADGE_KEYWORDS.some(function (kw) { return lower.includes(kw); });
+    }
+
+    for (const thumb of thumbs) {
+      const src = thumb.dataset.image;
+      if (!src || looksLikeBadge(src) || urlCounts[src] > REUSE_LIMIT) continue;
+
+      const img = new Image();
+      img.alt = '';
+      img.onload = function () {
+        if (img.naturalWidth < 150 || img.naturalHeight < 150) return; // icon-sized, not a real photo
+        const fallback = thumb.querySelector('.thumb-fallback');
+        if (fallback) fallback.style.display = 'none';
+        thumb.insertBefore(img, thumb.firstChild);
+      };
+      // onerror: do nothing — the monogram fallback is already in place.
+      img.src = src;
+    }
+  })();
 
   function countChecked() {
     let n = 0;
@@ -571,6 +687,7 @@
   const progressState          = document.getElementById('progressState');
   const completionCard         = document.getElementById('completionCard');
   const analysisStages         = Array.from(document.querySelectorAll('#analysisStageList .stage'));
+  const analysisProgressFill   = document.getElementById('analysisProgressFill');
   const liveProductsEl         = document.getElementById('liveProducts');
   const analysisProductCountEl = document.getElementById('analysisProductCount');
   const logToggle              = document.getElementById('logToggle');
@@ -603,6 +720,7 @@
       'Sentiment scoring complete',
       'Compiling executive report'
     ];
+    const progressWidths = [30, 62, 88];
 
     let stageIndex = 0;
     function advanceStage() {
@@ -611,10 +729,13 @@
         analysisStages[stageIndex - 1].classList.add('done');
       }
       if (stageIndex < analysisStages.length) {
+        analysisStages[stageIndex].classList.remove('pending');
         analysisStages[stageIndex].classList.add('active');
+        analysisProgressFill.style.width = progressWidths[stageIndex] + '%';
         // As with the discovery-phase overlay on the landing page, the last
-        // stage is deliberately left spinning rather than auto-marked done —
-        // real completion is only ever signalled by the fetch() resolving.
+        // stage is deliberately left in its active state rather than
+        // auto-marked done — real completion is only ever signalled by the
+        // fetch() resolving.
         if (stageIndex < analysisStages.length - 1) {
           setTimeout(advanceStage, 2200);
         }
@@ -643,6 +764,7 @@
       s.classList.remove('active');
       s.classList.add('done');
     });
+    analysisProgressFill.style.width = '100%';
     progressState.style.display = 'none';
     finalProductsEl.textContent = productCount;
     completionCard.classList.add('active');

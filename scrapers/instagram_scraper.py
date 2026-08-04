@@ -1,3 +1,35 @@
+"""
+Module Name
+-----------
+scrapers/instagram_scraper.py
+
+Purpose
+-------
+Collects genuine, product-specific captions and comments from Instagram —
+the company's own posts about a selected product, and the comments left
+on them — while avoiding generic brand-wide content where possible.
+
+Responsibilities
+-----------------
+- `scrape_instagram_comments(company_data)`: the single public entry
+  point. Locates relevant posts from the company's Instagram profile,
+  filters for product relevance, and collects caption/comment text up to
+  `config.MAX_INSTAGRAM_COMMENTS`.
+- Attaches to the shared Chromium process via `scrapers.browser_utils`
+  rather than launching its own, and logs `BROWSER_TRACE` timing at each
+  setup checkpoint, same as google_scraper.py / twitter_scraper.py /
+  youtube_scraper.py.
+- Instagram has no strict quantity target (per the project's own
+  priorities) — this module optimizes for reliability of what it can
+  collect rather than chasing a fixed volume, given how aggressively
+  Instagram gates unauthenticated/automated access.
+
+Dependencies
+------------
+`playwright` (sync API), plus standard library `asyncio`, `re`,
+`threading`, `time`.
+"""
+
 import asyncio
 import atexit
 import concurrent.futures
@@ -8,17 +40,16 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from scrapers.browser_utils import browser_launch_slot, normalize_comments, find_social_profile_url
+from scrapers.browser_utils import browser_manager, normalize_comments, find_social_profile_url
 from config import (
     MAX_INSTAGRAM_COMMENTS,
     MAX_SCROLL_ITERATIONS,
     SCROLL_IDLE_LIMIT,
     NAVIGATION_RETRIES,
-    NAV_TIMEOUT_MS,
     NAV_TIMEOUT_MS_MAX,
     NAV_TIMEOUT_MS_MIN,
 )
@@ -43,17 +74,45 @@ MAX_POSTS_TO_VISIT = 20
 MAX_POSTS_TO_DISCOVER = 8
 
 # --- Hard internal time budget -----------------------------------------
-# Kept a few seconds under the outer asyncio.wait_for() cap applied in
-# app.py (26s, widened from 20s - the old value was below observed
-# setup_time (~7.4s) + this budget (12s), leaving only ~0.6s of margin
-# before debug-artifact/screenshot capture on a failure path could push
-# the outer timeout past its own cap) so this scraper almost always
-# returns on its own, with whatever it has collected so far, instead of
-# being cut off cold by the outer timeout and losing partial results.
-# Lowered from 16 -> 12 now that
-# navigation itself fails fast (NAV_TIMEOUT_MS, NAVIGATION_RETRIES in
-# config.py).
+# PREVIOUS BUG (same class of bug already fixed in twitter_scraper.py -
+# see that file's OUTER_HARD_TIMEOUT_SECONDS block for the full writeup):
+# `deadline = start + TIME_BUDGET_SECONDS` below used to start a FRESH
+# clock only after browser/context/page setup had already finished, with
+# no memory of how much of the OUTER app.py wait_for() budget setup
+# itself had already spent. Setup alone was regularly taking ~25-32s
+# under this app's shared-Chromium contention at the start of an analysis
+# run (see BROWSER_TRACE logs), so "setup (32s) + a fresh 20s budget"
+# routinely added up to ~50s+ of real work against app.py's actual 34s
+# INSTAGRAM_TIMEOUT_SECONDS cap. The stale comment this block used to
+# carry ("kept under app.py's 26s cap") was itself evidence of the bug:
+# app.py's real value is 34s and had drifted out of sync with this file.
+# Concretely, this meant: app.py's outer wait_for() would hard-cancel the
+# coroutine at 34s and use [] as the result, while the *actual* _run()
+# kept executing to completion unseen on its executor thread - sometimes
+# finding several real comments (see "Instagram items ... final=6" in
+# production logs) that were computed correctly but never made it back to
+# the dashboard, because the coroutine that would have returned them had
+# already been cancelled.
+#
+# Fixed below the same way as twitter_scraper.py: one real wall-clock
+# deadline anchored to the moment scrape_instagram_comments() itself
+# starts (before the httpx preflight), via OUTER_HARD_TIMEOUT_SECONDS /
+# SAFETY_MARGIN_SECONDS, so _run() always leaves real margin for its
+# result to make it back through run_in_executor()/wait_for() no matter
+# how long setup took. TIME_BUDGET_SECONDS is kept only as the
+# "no contention at all" reference value the comments above still
+# describe; deadline/time_left() (see _run()) are what the code actually
+# uses now.
+OUTER_HARD_TIMEOUT_SECONDS = 30  # cut from 45 - priority shifted to 3-min total time. must be kept in sync with app.py's INSTAGRAM_TIMEOUT_SECONDS
+SAFETY_MARGIN_SECONDS = 8.0
+MIN_USEFUL_BUDGET_SECONDS = 6.0  # below this, don't even attempt navigation
+
 TIME_BUDGET_SECONDS = 20
+
+# Ceiling on how long the zero-result debug-artifact screenshot is allowed
+# to spend, no matter how unresponsive the page is. Mirrors
+# twitter_scraper.py's constant of the same name/purpose.
+DEBUG_CAPTURE_TIMEOUT_MS = 1500
 
 _CHROME_MARKERS = (
     "followers", " posts", "view full profile", "following",
@@ -128,6 +187,7 @@ MAX_BROWSER_WORKERS = 3
 MAX_USES_BEFORE_RECYCLE = 50
 
 _thread_local = threading.local()
+_browser_trace = threading.local()
 _EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=MAX_BROWSER_WORKERS, thread_name_prefix="instagram_scraper"
 )
@@ -258,6 +318,8 @@ atexit.register(_shutdown_all_workers)
 def _ensure_context():
     """Get (creating or recycling as needed) this thread's browser context."""
     handle = _get_handle()
+    browser_trace_started_at = time.monotonic()
+    _browser_trace.ensure_context_started_at = browser_trace_started_at
     ctx = handle.context
 
     if ctx is not None:
@@ -285,15 +347,46 @@ def _ensure_context():
 
     pw = handle.playwright
     if pw is None:
+        logger.info(
+            "BROWSER_TRACE scraper=Instagram event=before_sync_playwright_start elapsed=%.3fs timestamp=%.3f thread=%s",
+            time.monotonic() - browser_trace_started_at, time.time(), threading.current_thread().name,
+        )
         pw = sync_playwright().start()
+        logger.info(
+            "BROWSER_TRACE scraper=Instagram event=after_sync_playwright_start elapsed=%.3fs timestamp=%.3f thread=%s",
+            time.monotonic() - browser_trace_started_at, time.time(), threading.current_thread().name,
+        )
         handle.playwright = pw
 
-    with browser_launch_slot():
-        browser = pw.chromium.launch(headless=True, args=_LAUNCH_ARGS)
+    logger.info(
+        "BROWSER_TRACE scraper=Instagram event=before_shared_browser_attach elapsed=%.3fs timestamp=%.3f thread=%s",
+        time.monotonic() - browser_trace_started_at, time.time(), threading.current_thread().name,
+    )
+    # Attach to the ONE application-wide Chromium process instead of
+    # launching a new one. ensure_shared_browser() only actually launches
+    # Chromium on the very first call anywhere in the process; every call
+    # after that - including this one, almost always - just returns the
+    # existing CDP endpoint immediately. This (not a per-call launch slot)
+    # is what removes the 44-46s startup stall: see browser_utils.py's
+    # BrowserManager.ensure_shared_browser() docstring for the mechanics.
+    cdp_endpoint = browser_manager.ensure_shared_browser()
+    browser = pw.chromium.connect_over_cdp(cdp_endpoint)
+    logger.info(
+        "BROWSER_TRACE scraper=Instagram event=after_shared_browser_attach elapsed=%.3fs timestamp=%.3f thread=%s",
+        time.monotonic() - browser_trace_started_at, time.time(), threading.current_thread().name,
+    )
+    logger.info(
+        "BROWSER_TRACE scraper=Instagram event=before_new_context elapsed=%.3fs timestamp=%.3f thread=%s",
+        time.monotonic() - browser_trace_started_at, time.time(), threading.current_thread().name,
+    )
     context = browser.new_context(
         user_agent=_USER_AGENT,
         locale="en-US",
         viewport={"width": 1280, "height": 900},
+    )
+    logger.info(
+        "BROWSER_TRACE scraper=Instagram event=after_new_context elapsed=%.3fs timestamp=%.3f thread=%s",
+        time.monotonic() - browser_trace_started_at, time.time(), threading.current_thread().name,
     )
     context.set_default_timeout(8000)
     context.set_default_navigation_timeout(10000)
@@ -304,6 +397,57 @@ def _ensure_context():
     handle.uses = 1
     logger.info("Launched a new browser context on %s.", threading.current_thread().name)
     return context
+
+
+# --- Startup pre-warm --------------------------------------------------
+# Same fix as twitter_scraper.py's identically-named block: setup alone
+# (this thread's own sync_playwright().start() + attaching to the shared
+# Chromium process + new_context()) was regularly taking 25-32s+ under
+# this app's shared-browser contention at the start of an analysis run -
+# see the OUTER_HARD_TIMEOUT_SECONDS block above. That cost is a ONE-TIME,
+# per-worker-thread cost (_ensure_context above reuses a live context on
+# later calls via a cheap `ctx.pages` check), so pay it once here, in the
+# background, at module import time - i.e. when the FastAPI app boots up
+# - well before the first real request in practice, since the user still
+# has to go through Company/Product Discovery and pick a product before
+# this module's scrape_instagram_comments() is ever called.
+#
+# MAX_BROWSER_WORKERS separate jobs are submitted (not just one) so every
+# thread this module's own _EXECUTOR could later hand a real _run() to
+# gets warmed, not just whichever one happens to run first.
+#
+# Best-effort only and never blocks import: each job runs on _EXECUTOR's
+# own worker threads, and any failure is caught and logged - the first
+# real request then simply falls back to paying the setup cost itself,
+# exactly as it did before this change.
+def _warm_up_browser_context() -> None:
+    # Without this guard, this raises NotImplementedError on every warm-up
+    # thread on Windows: app.py sets WindowsSelectorEventLoopPolicy
+    # process-wide at import time (see browser_utils.py), but only the
+    # Proactor loop can launch subprocesses on Windows, and Playwright's
+    # sync API spawns its driver as a subprocess. The real request path
+    # (_run_sync()/_run(), below) already re-asserts Proactor for the
+    # same reason; this warm-up needs its own copy since it runs on a
+    # separate thread, before any real request ever calls it.
+    if sys.platform.startswith("win"):
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    try:
+        _ensure_context()
+        logger.info(
+            "Instagram: browser context pre-warmed on %s.",
+            threading.current_thread().name,
+        )
+    except Exception:
+        logger.exception(
+            "Instagram: background browser context warm-up failed on %s "
+            "(non-fatal - the first real request will pay the setup "
+            "cost itself instead, same as before this change).",
+            threading.current_thread().name,
+        )
+
+
+for _ in range(MAX_BROWSER_WORKERS):
+    _EXECUTOR.submit(_warm_up_browser_context)
 
 
 def _is_non_review(text: str) -> bool:
@@ -406,10 +550,12 @@ def _diagnose_page_state(page) -> str:
 # endpoint enough that it's no longer a reliable dodge. Instagram is
 # optional per the pipeline's priority order, so checking for that same
 # login wall with one plain HTTP GET, BEFORE ever calling _ensure_context(),
-# means a blocked profile never consumes one of the shared browser-launch
-# slots (browser_launch_slot()) - freeing that capacity for Google/YouTube
-# instead, without touching MAX_CONCURRENT_BROWSER_LAUNCHES or any timeout
-# constant.
+# means a blocked profile never spends a worker thread on a CDP attach +
+# new_context() + navigation at all - freeing that worker sooner for the
+# next job, even though attaching to the shared browser (see
+# browser_utils.ensure_shared_browser()) is no longer the scarce resource
+# it used to be now that Chromium itself is only launched once,
+# application-wide.
 _PREFLIGHT_TIMEOUT_SECONDS = 4.0
 _IG_LOGIN_MARKERS = ("/accounts/login", "/challenge")
 _IG_LOGIN_TEXT_MARKERS = (
@@ -428,6 +574,16 @@ def _httpx_preflight(url: str) -> "Tuple[bool, str]":
     * html - whatever HTML came back, so the caller can mine the
       contextJSON payload out of it (present even on login-walled embed
       pages) instead of throwing the response away.
+
+    Headers below were widened from a bare User-Agent (the previous
+    version) to a fuller, realistic browser set - a request carrying
+    ONLY a User-Agent is itself an anomaly no real browser produces, and
+    a captured live run showed this exact URL serving a completely
+    different, data-free response (the same client-side Polaris app
+    shell used for the main site, no contextJSON at all) to that
+    single-header request. This won't necessarily change Instagram's
+    behavior - see _looks_like_anonymous_shell() below for the fallback
+    if it doesn't - but it costs nothing and removes one obvious tell.
     """
     try:
         with httpx.Client(follow_redirects=True) as client:
@@ -439,6 +595,21 @@ def _httpx_preflight(url: str) -> "Tuple[bool, str]":
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                         "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
                     ),
+                    "Accept": (
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                        "image/avif,image/webp,*/*;q=0.8"
+                    ),
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "Upgrade-Insecure-Requests": "1",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "none",
+                    "Sec-Fetch-User": "?1",
+                    "Sec-CH-UA": '"Chromium";v="124", "Not-A.Brand";v="99"',
+                    "Sec-CH-UA-Mobile": "?0",
+                    "Sec-CH-UA-Platform": '"Windows"',
+                    "Connection": "keep-alive",
                 },
             )
     except Exception:
@@ -450,6 +621,43 @@ def _httpx_preflight(url: str) -> "Tuple[bool, str]":
         return True, html
     body_sample = html[:20000].lower()
     return any(marker in body_sample for marker in _IG_LOGIN_TEXT_MARKERS), html
+
+
+# A live capture on 2026-07-22 showed the embed URL serving a 600KB+
+# response that returns 200 OK, isn't caught by _IG_LOGIN_TEXT_MARKERS
+# (no "log in" text anywhere), and yet carries zero post/caption data -
+# it's Instagram's normal logged-out "Polaris" web-app shell (React
+# app config + CSS variables + feature flags only), not the lighter
+# legacy embed page contextJSON relies on. The browser fallback that
+# ran immediately afterward hit an actual rendered login wall on BOTH
+# the embed and profile URLs for the same profile in that same run -
+# so when this shell shows up, spending ~20-30s on Playwright
+# navigation has (so far, empirically) never once recovered anything
+# it didn't already know was unavailable. Recognizing it lets the
+# caller skip straight to returning early, same as a normal blocked
+# preflight, instead of paying for a browser attempt already shown
+# unlikely to help.
+#
+# Deliberately conservative: only fires when BOTH the Polaris shell's
+# own marker is present AND every known real-data marker is absent, so
+# a page that happens to be a Polaris page but still carries data isn't
+# misclassified.
+_POLARIS_SHELL_MARKERS = ("PolarisProfilePage", "PolarisSEO")
+_REAL_DATA_MARKERS = (
+    "contextJSON", "graphql_media", "edge_media_to_caption",
+    "biography", "edge_owner_to_timeline_media",
+)
+
+
+def _looks_like_anonymous_shell(html: str) -> bool:
+    if not html:
+        return False
+    return (
+        any(m in html for m in _POLARIS_SHELL_MARKERS)
+        and not any(m in html for m in _REAL_DATA_MARKERS)
+    )
+
+
 
 
 def _looks_blocked(page) -> bool:
@@ -470,29 +678,52 @@ def _looks_blocked(page) -> bool:
 _CONTEXT_JSON_RE = re.compile(r'"contextJSON":"((?:[^"\\]|\\.)*)"')
 
 
-def _parse_embed_context(html: str) -> "Tuple[List[str], List[str]]":
-    """Extract (caption/comment texts, post shortcodes) from a profile or
-    post /embed/ page's raw HTML. Returns ([], []) when the payload is
-    absent or unparseable — callers treat that as "nothing found", never
-    as an error."""
+def _extract_context_media_nodes(html: str) -> List[dict]:
+    """Parse the contextJSON payload out of a profile/post /embed/ page's
+    raw HTML and return the raw list of per-post ``shortcode_media`` node
+    dicts (one entry per post Instagram included in that page's payload).
+    Returns [] when the payload is absent or unparseable — callers treat
+    that as "nothing found", never as an error.
+
+    Shared by _parse_embed_context() (flattened, for pages that only ever
+    carry one post) and _parse_embed_context_grouped() (kept per-post, for
+    the profile page - see that function's docstring for why the two
+    differ)."""
     if not html:
-        return [], []
+        return []
     m = _CONTEXT_JSON_RE.search(html)
     if not m:
-        return [], []
+        return []
     try:
         # The payload is a JSON string *inside* a JSON document, so it
         # decodes in two steps: un-escape the string, then parse it.
         data = json.loads(json.loads('"' + m.group(1) + '"'))
     except Exception:
-        return [], []
+        return []
     ctx = (data or {}).get("context") or {}
-    texts: List[str] = []
-    shortcodes: List[str] = []
+    nodes: List[dict] = []
     for media in ctx.get("graphql_media") or []:
         node = (media or {}).get("shortcode_media") or {}
-        if not isinstance(node, dict):
-            continue
+        if isinstance(node, dict) and node:
+            nodes.append(node)
+    return nodes
+
+
+def _parse_embed_context(html: str) -> "Tuple[List[str], List[str]]":
+    """Extract (caption/comment texts, post shortcodes) from a profile or
+    post /embed/ page's raw HTML, flattened across every post the payload
+    carries. Returns ([], []) when the payload is absent or unparseable —
+    callers treat that as "nothing found", never as an error.
+
+    Safe on a page that only ever describes ONE post (an individual
+    post's /embed/captioned/ page) since there is no post boundary to
+    lose there. On a page that can carry SEVERAL posts at once (the
+    profile grid), use _parse_embed_context_grouped() instead — flattening
+    there would mean a product-specific filter can no longer tell which
+    caption a given comment's own post actually had."""
+    texts: List[str] = []
+    shortcodes: List[str] = []
+    for node in _extract_context_media_nodes(html):
         sc = node.get("shortcode")
         if sc and sc not in shortcodes:
             shortcodes.append(sc)
@@ -503,6 +734,73 @@ def _parse_embed_context(html: str) -> "Tuple[List[str], List[str]]":
                 if text:
                     texts.append(text)
     return texts, shortcodes
+
+
+def _parse_embed_context_grouped(html: str) -> "List[Dict[str, Any]]":
+    """Same contextJSON payload as _parse_embed_context(), kept grouped by
+    post instead of flattened. Returns one dict per post: {"shortcode":
+    str|None, "caption": str, "comments": List[str]}.
+
+    _parse_embed_context() throws away which caption a given comment's
+    post actually had, which is harmless on a single-post page but not on
+    the profile grid: that page's payload can describe several different
+    recent posts at once, each with its own caption and its own comments.
+    Preserving the grouping lets a product-specific job gate on each
+    POST's own caption - the same "check the caption once, then trust the
+    whole thread" rule the per-post browser visit further below already
+    applies - instead of independently pattern-matching every individual
+    comment's own text against the product name. Real commenters almost
+    never restate the full product name in a comment ("love these!",
+    "how's the battery on these?"), so per-comment-text filtering quietly
+    discards most genuine, on-topic comments that a caption-level gate
+    would correctly keep - see _select_relevant_texts() below, which
+    consumes this function's output."""
+    posts: "List[Dict[str, Any]]" = []
+    for node in _extract_context_media_nodes(html):
+        caption = ""
+        for edge in ((node.get("edge_media_to_caption") or {}).get("edges")) or []:
+            text = (((edge or {}).get("node") or {}).get("text") or "").strip()
+            if text:
+                caption = text
+                break
+        comments: List[str] = []
+        for key in ("edge_media_to_parent_comment", "edge_media_preview_comment"):
+            for edge in ((node.get(key) or {}).get("edges")) or []:
+                text = (((edge or {}).get("node") or {}).get("text") or "").strip()
+                if text:
+                    comments.append(text)
+        posts.append({
+            "shortcode": node.get("shortcode"),
+            "caption": caption,
+            "comments": comments,
+        })
+    return posts
+
+
+def _select_relevant_texts(posts: "List[Dict[str, Any]]", product_name: str) -> List[str]:
+    """Given _parse_embed_context_grouped()'s per-post list, return the
+    caption/comment texts worth keeping for this job.
+
+    No product_name (the "General" job): every post is relevant by
+    definition, so every caption and comment text is kept - mirrors
+    _add_if_relevant()'s own "no product_name" branch below.
+
+    With a product_name: gate per POST on that post's own caption; if it
+    mentions the product, keep that caption plus ALL of that post's
+    comments, regardless of whether each comment's own text happens to
+    repeat the product name. If the caption doesn't mention the product,
+    skip the whole post - including any comment on it that might
+    coincidentally contain the product's tokens, since that comment's
+    own post was never actually about this product."""
+    out: List[str] = []
+    for post in posts:
+        caption = post.get("caption") or ""
+        if product_name and not _mentions_product(caption, product_name):
+            continue
+        if caption:
+            out.append(caption)
+        out.extend(post.get("comments") or [])
+    return out
 
 
 def _clean_candidate(txt: str) -> str:
@@ -529,6 +827,52 @@ def _clean_candidate(txt: str) -> str:
 _DEBUG_DIR = Path(__file__).resolve().parent.parent / "debug"
 
 
+def _title_bounded(page, timeout_ms: int, default: str = "<unavailable>") -> str:
+    """Get the page title with a timeout that Playwright actually honors.
+
+    ``page.title()`` takes no ``timeout`` argument and is not covered by
+    ``page.set_default_timeout()`` either - verified against Playwright's
+    own ``Frame.title()``, which sends its protocol call with no timeout
+    calculator at all, so on a page left in a half-navigated/unresponsive
+    state it can hang indefinitely waiting for a browser response that
+    never comes. That is the actual mechanism behind "gave up on
+    navigation with time to spare, still got cut off by the outer timeout"
+    in production logs (same root cause found and fixed once already in
+    twitter_scraper.py, which this scraper independently had too).
+
+    ``Locator.text_content(timeout=...)``, unlike ``page.title()``, DOES
+    route through Playwright's real timeout machinery. Querying the
+    ``<title>`` element this way gets the same information with an
+    actually-enforced bound, and does it on the calling thread - a
+    cross-thread watchdog was tried for this in twitter_scraper.py first
+    and abandoned: Playwright's sync API is greenlet-bound to whichever
+    thread started it, and calling it from another thread breaks that
+    binding (surfaces as "greenlet.error: cannot switch to a different
+    thread" and orphaned "Task exception was never retrieved" warnings).
+    """
+    try:
+        return page.locator("title").text_content(timeout=timeout_ms) or default
+    except Exception:
+        return default
+
+
+def _content_bounded(page, timeout_ms: int) -> Optional[str]:
+    """Get an HTML dump with a timeout Playwright actually honors, for the
+    same reason ``_title_bounded`` exists: ``page.content()`` takes no
+    timeout and isn't covered by ``set_default_timeout()``.
+    ``Locator.inner_html(timeout=...)`` on the ``html`` element IS
+    genuinely bounded. Returns ``None`` (rather than a watered-down guess)
+    if it can't get the HTML within the timeout, so callers can treat that
+    as "no content available" instead of silently hanging or getting an
+    empty string that reads as "the page really was empty".
+    """
+    try:
+        inner = page.locator("html").inner_html(timeout=timeout_ms)
+    except Exception:
+        return None
+    return f"<html>{inner}</html>"
+
+
 def _save_debug_artifacts(page, identifier: str, reason: str, extra: Dict[str, str] = None) -> None:
     """Save HTML/screenshot/context ONLY on failure/zero-results for
     debugging. Never on the success path.
@@ -548,25 +892,58 @@ def _save_debug_artifacts(page, identifier: str, reason: str, extra: Dict[str, s
         stamp = f"{time.strftime('%Y%m%d_%H%M%S')}_{int(time.time() * 1000) % 1000:03d}_{threading.get_ident()}"
         base = _DEBUG_DIR / f"instagram_{safe_id}_{stamp}"
 
+        # This capture only ever runs on a failure/zero-result path, right
+        # after the scraper has already decided to give up - it must never
+        # be allowed to itself eat into the SAFETY_MARGIN_SECONDS the
+        # deadline math budgeted for returning cleanly.
+        #
+        # page.screenshot() below takes an explicit timeout= and is
+        # genuinely bounded by it. Title/HTML capture go through
+        # _title_bounded()/_content_bounded() instead of raw
+        # page.title()/page.content(), which take no timeout parameter and
+        # are not covered by set_default_timeout() either - on a page left
+        # in exactly the half-navigated/unresponsive state this function
+        # exists to diagnose, either raw call can hang indefinitely waiting
+        # for a browser response that never comes, blowing through the
+        # safety margin and getting the whole job cancelled by app.py's
+        # outer hard timeout before _run() can return - which throws away
+        # results that were otherwise fine. That is the concrete mechanism
+        # behind "gave up on navigation with time to spare, still got cut
+        # off by the outer timeout" in production logs.
+        try:
+            page.set_default_timeout(1000)
+        except Exception:
+            pass
+
         try:
             final_url = page.url or ""
         except Exception:
             final_url = "<unavailable>"
-        try:
-            title = page.title()
-        except Exception:
-            title = "<unavailable>"
+        title = _title_bounded(page, 1000)
 
         try:
-            page.screenshot(path=f"{base}.png", timeout=3000, full_page=True)
+            # viewport-only + a short bounded timeout, not full_page: a
+            # feed page whose comments never finished settling (exactly
+            # the case this runs on) can make a full_page screenshot keep
+            # scrolling/re-laying-out for the whole 3s this used to allow,
+            # for a debug artifact that never needed the full scroll
+            # history anyway. Mirrors the same fix already applied to
+            # twitter_scraper.py's DEBUG_CAPTURE_TIMEOUT_MS.
+            page.screenshot(path=f"{base}.png", timeout=DEBUG_CAPTURE_TIMEOUT_MS, full_page=False)
         except Exception:
             logger.warning("[INSTAGRAM_DEBUG] could not capture screenshot for %s", identifier)
 
-        try:
-            with open(f"{base}.html", "w", encoding="utf-8") as f:
-                f.write(page.content())
-        except Exception:
-            logger.warning("[INSTAGRAM_DEBUG] could not capture HTML for %s", identifier)
+        html = _content_bounded(page, 1500)
+        if html is not None:
+            try:
+                with open(f"{base}.html", "w", encoding="utf-8") as f:
+                    f.write(html)
+            except Exception:
+                logger.warning("[INSTAGRAM_DEBUG] could not capture HTML for %s", identifier)
+        else:
+            logger.warning(
+                "[INSTAGRAM_DEBUG] could not capture HTML for %s (timed out or errored)", identifier
+            )
 
         info = {
             "reason": reason,
@@ -808,7 +1185,36 @@ def _scroll_until_idle(page, time_left, count_fn, max_items: int, scroll_target=
     return max(prev_count, 0)
 
 
+def _mentions_product(text: str, product_name: str) -> bool:
+    """Same precise/strict matcher as twitter_scraper.py's version: every
+    meaningful token of ``product_name`` must appear in ``text``. Used to
+    decide, per-post, whether a caption is actually about this specific
+    product before spending time budget expanding its comments.
+    """
+    if not text or not product_name:
+        return False
+    text_l = text.lower()
+    tokens = [t for t in re.findall(r"[a-z0-9]+", product_name.lower()) if len(t) > 1]
+    if not tokens:
+        return False
+    return all(t in text_l for t in tokens)
+
+
 async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
+    # Anchor point for the real wall-clock deadline (see the
+    # OUTER_HARD_TIMEOUT_SECONDS block above). Captured before the httpx
+    # preflight check and before this job is even submitted to the
+    # executor, so _run()'s deadline reflects the FULL time app.py's outer
+    # wait_for() has already been counting against this coroutine - not
+    # just the part after browser/context/page setup finishes.
+    _overall_start = time.monotonic()
+
+    # When set, this call is for one specific selected product (not the
+    # brand-wide "General" job) - every content source below gets filtered
+    # down to posts/captions that actually mention it, instead of dumping
+    # the brand's whole recent-posts feed.
+    product_name = (company_data.get("product_name") or "").strip()
+
     target = (
         company_data.get("instagram_url")
         or company_data.get("instagram")
@@ -857,28 +1263,79 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
     except Exception:
         preflight_blocked, preflight_html = False, ""
 
+    # TEMP DIAGNOSTIC: the live preflight response is currently invisible
+    # once this function returns - only the *browser's* failed page state
+    # gets written to debug/. Log + save it unconditionally so a run that
+    # comes back with zero seed_texts tells us WHY (short/blocked body?
+    # contextJSON missing entirely? present but unparseable?) instead of
+    # just that it happened. Safe to remove once Instagram is confirmed
+    # working again.
+    logger.info(
+        "Instagram scrape: preflight GET %s -> %d byte(s), "
+        "contextJSON_substring_present=%s, blocked=%s.",
+        embed_preflight_url, len(preflight_html or ""),
+        "contextJSON" in (preflight_html or ""), preflight_blocked,
+    )
+    if preflight_html:
+        try:
+            _DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+            with open(_DEBUG_DIR / "instagram_preflight_last.html", "w", encoding="utf-8") as _f:
+                _f.write(preflight_html)
+        except Exception:
+            logger.warning("Instagram scrape: could not save preflight diagnostic HTML.")
+
     # Mine the embed page's contextJSON payload (recent posts' captions +
     # shortcodes) out of the plain-HTTP response before any browser work.
     # This survives the login wall: Instagram walls the rendered DOM but
     # still ships this JSON in the same HTML.
     seed_texts, seed_shortcodes = _parse_embed_context(preflight_html)
+    # Kept grouped by post too (same payload, see _parse_embed_context_grouped's
+    # docstring) so a product-specific job can gate on each post's own
+    # caption instead of pattern-matching every individual caption/comment
+    # text - both the early-return branch just below and _run() further
+    # down use this instead of the flat seed_texts for relevance decisions.
+    seed_posts = _parse_embed_context_grouped(preflight_html)
     if seed_texts or seed_shortcodes:
         logger.info(
             "Instagram scrape: embedded contextJSON on %s yielded %d "
-            "caption/comment text(s) and %d post shortcode(s) without a browser.",
-            embed_preflight_url, len(seed_texts), len(seed_shortcodes),
+            "caption/comment text(s) across %d post(s) without a browser.",
+            embed_preflight_url, len(seed_texts), len(seed_posts),
         )
 
-    if preflight_blocked:
+    anonymous_shell = (
+        not preflight_blocked
+        and not seed_texts and not seed_shortcodes
+        and _looks_like_anonymous_shell(preflight_html)
+    )
+
+    if preflight_blocked or anonymous_shell:
+        # Gate per-post on each post's own caption before cleaning, rather
+        # than cleaning every flattened text and then separately
+        # pattern-matching each one against the product name - the latter
+        # discards genuine comments that don't happen to repeat the
+        # product name back (see _select_relevant_texts()'s docstring).
+        relevant_texts = _select_relevant_texts(seed_posts, product_name)
         seed_clean = normalize_comments(
-            [t for t in (_clean_candidate(c) for c in seed_texts) if t]
+            [t for t in (_clean_candidate(c) for c in relevant_texts) if t]
         )[:MAX_INSTAGRAM_COMMENTS]
-        logger.info(
-            "Instagram scrape: preflight detected a login wall for %s before "
-            "touching the browser pool - returning %d embedded-JSON item(s) "
-            "immediately (reason=login_wall, no Chromium launch spent on this).",
-            embed_preflight_url, len(seed_clean),
-        )
+        if anonymous_shell:
+            logger.info(
+                "Instagram scrape: preflight for %s came back as the "
+                "logged-out Polaris app shell (no contextJSON, no post "
+                "data of any kind) rather than a login-wall redirect - "
+                "returning %d embedded item(s) immediately instead of "
+                "spending the browser budget on a page shown (in every "
+                "run checked so far) to also render a login wall "
+                "(reason=anonymous_shell, no Chromium launch spent on this).",
+                embed_preflight_url, len(seed_clean),
+            )
+        else:
+            logger.info(
+                "Instagram scrape: preflight detected a login wall for %s before "
+                "touching the browser pool - returning %d embedded-JSON item(s) "
+                "immediately (reason=login_wall, no Chromium launch spent on this).",
+                embed_preflight_url, len(seed_clean),
+            )
         return seed_clean
 
     def _run() -> List[str]:
@@ -915,32 +1372,75 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
             seen.add(key)
             results.append(txt)
 
-        # Captions recovered browser-free from the embed page's contextJSON
-        # payload go in first — the browser passes below only need to add
-        # to them (and the dedupe in _add keeps overlap harmless).
-        for txt in seed_texts:
+        def _add_if_relevant(txt: str) -> None:
+            # For the "General" job (no product_name) every candidate is
+            # relevant by definition. For a product-specific job, only
+            # keep text that actually mentions the product - genuine over
+            # volume, no falling back to unrelated brand content.
+            if not product_name or _mentions_product(txt, product_name):
+                _add(txt)
+
+        # Captions/comments recovered browser-free from the embed page's
+        # contextJSON payload go in first — the browser passes below only
+        # need to add to them (and the dedupe in _add keeps overlap
+        # harmless). Already gated per-post by _select_relevant_texts(), so
+        # this calls _add() directly rather than _add_if_relevant(), which
+        # would re-run the per-text relevance check and wrongly reject a
+        # genuine comment just because it doesn't itself repeat the
+        # product name.
+        for txt in _select_relevant_texts(seed_posts, product_name):
             _add(txt)
 
         page = None
         try:
+            logger.info(
+                "BROWSER_TRACE scraper=Instagram event=before_new_page elapsed=%.3fs timestamp=%.3f thread=%s",
+                time.monotonic() - getattr(_browser_trace, "ensure_context_started_at", time.monotonic()), time.time(), threading.current_thread().name,
+            )
             page = context.new_page()
+            logger.info(
+                "BROWSER_TRACE scraper=Instagram event=after_new_page elapsed=%.3fs timestamp=%.3f thread=%s",
+                time.monotonic() - getattr(_browser_trace, "ensure_context_started_at", time.monotonic()), time.time(), threading.current_thread().name,
+            )
             page.set_default_timeout(7000)
 
-            # The internal time budget clock starts here, only AFTER
-            # browser launch, context creation, and page creation have all
-            # finished - not before. Starting the clock earlier meant
-            # Chromium/context startup time silently ate into the budget
-            # before navigation ever got a chance to run, which is exactly
-            # what produced "Skipping navigation: out of time budget"
-            # before the page had even been opened.
             setup_elapsed = time.monotonic() - setup_start
             start = time.monotonic()
-            deadline = start + TIME_BUDGET_SECONDS
+            # Deadline anchored to the OUTER hard timeout (app.py's
+            # INSTAGRAM_TIMEOUT_SECONDS), counted from when this coroutine
+            # actually started (_overall_start) - not a fresh
+            # TIME_BUDGET_SECONDS clock that ignores how much of the outer
+            # budget setup already used. This guarantees _run() always
+            # leaves SAFETY_MARGIN_SECONDS of real slack for the result to
+            # make it back through run_in_executor()/wait_for(), no matter
+            # how long setup took under this app's shared-browser
+            # contention. See the OUTER_HARD_TIMEOUT_SECONDS block above.
+            deadline = _overall_start + OUTER_HARD_TIMEOUT_SECONDS - SAFETY_MARGIN_SECONDS
+            remaining_budget = deadline - start
+
             logger.info(
-                "Instagram scrape: browser/context/page setup took %.1fs; "
-                "starting %ds navigation+scrape budget now.",
-                setup_elapsed, TIME_BUDGET_SECONDS,
+                "Instagram scrape: browser/context/page setup took %.1fs "
+                "(%.1fs elapsed since job start); %.1fs left for "
+                "navigation+scrape before the safety-margined internal "
+                "deadline (outer cap=%ds, safety margin=%.1fs).",
+                setup_elapsed,
+                start - _overall_start,
+                remaining_budget,
+                OUTER_HARD_TIMEOUT_SECONDS,
+                SAFETY_MARGIN_SECONDS,
             )
+
+            if remaining_budget <= MIN_USEFUL_BUDGET_SECONDS:
+                logger.warning(
+                    "Instagram scrape: only %.1fs left for %s after a "
+                    "%.1fs setup (job start to now: %.1fs) - not enough "
+                    "time to attempt navigation; returning early (with "
+                    "whatever embedded-JSON seed content was already "
+                    "collected) instead of risking the outer hard timeout.",
+                    remaining_budget, profile_url, setup_elapsed,
+                    time.monotonic() - _overall_start,
+                )
+                return normalize_comments(results)[:MAX_INSTAGRAM_COMMENTS]
 
             def time_left() -> float:
                 return deadline - time.monotonic()
@@ -993,7 +1493,7 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
                     )
                     for loc in caption_loc.all():
                         try:
-                            _add(loc.inner_text())
+                            _add_if_relevant(loc.inner_text())
                         except Exception:
                             pass
                 # The rendered DOM is usually login-walled, but the page
@@ -1001,10 +1501,21 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
                 # here too in case the browser was served a different
                 # variant than the httpx preflight (or the preflight failed).
                 try:
-                    page_texts, page_shortcodes = _parse_embed_context(page.content())
-                    for txt in page_texts:
+                    embed_html = _content_bounded(page, 1500)
+                    # Grouped (not the flat _parse_embed_context) since this
+                    # is the profile grid - it can describe several posts
+                    # in one payload, and _add_if_relevant() on the
+                    # flattened text would filter each caption/comment
+                    # independently, losing which post a given comment
+                    # actually belongs to (see _parse_embed_context_grouped's
+                    # docstring).
+                    page_posts = _parse_embed_context_grouped(embed_html)
+                    for txt in _select_relevant_texts(page_posts, product_name):
                         _add(txt)
-                    for sc in page_shortcodes:
+                    for post in page_posts:
+                        sc = post.get("shortcode")
+                        if not sc:
+                            continue
                         link = f"https://www.instagram.com/p/{sc}/"
                         if link not in post_links:
                             post_links.append(link)
@@ -1052,11 +1563,36 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
                                         page, _CAPTION_SELECTOR_CHAIN
                                     )
                                     if overlay_loc is not None:
+                                        # _CAPTION_SELECTOR_CHAIN matches
+                                        # both the caption and comment
+                                        # list items (see its definition),
+                                        # and every element it finds here
+                                        # comes from the ONE post this
+                                        # overlay opened for. Gate once
+                                        # across everything found - the
+                                        # same "check once, keep the whole
+                                        # thread" rule the per-post browser
+                                        # visit below uses - instead of
+                                        # re-testing each element on its
+                                        # own text, which would silently
+                                        # drop genuine comments that don't
+                                        # individually repeat the product
+                                        # name (the same issue the
+                                        # contextJSON grouping fix
+                                        # addressed for the profile-level
+                                        # payload).
+                                        overlay_texts = []
                                         for loc in overlay_loc.all():
                                             try:
-                                                _add(loc.inner_text())
+                                                overlay_texts.append(loc.inner_text())
                                             except Exception:
                                                 pass
+                                        if not product_name or any(
+                                            _mentions_product(t, product_name)
+                                            for t in overlay_texts
+                                        ):
+                                            for t in overlay_texts:
+                                                _add(t)
                                 except Exception:
                                     pass
                             page.go_back(timeout=3000)
@@ -1096,14 +1632,23 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
                             profile_url, reason,
                         )
                     else:
-                        for sel in ["span._aacl", "div._aacl", "h1", "span"]:
-                            for loc in page.locator(sel).all()[:50]:
-                                try:
-                                    txt = loc.inner_text()
-                                    if txt and len(txt.split()) >= 6:
-                                        _add(txt)
-                                except Exception:
-                                    pass
+                        # Header/bio text here is profile-level chrome, not
+                        # post content - it's essentially never genuinely
+                        # about one specific product, so skip adding it at
+                        # all for a product-specific job rather than
+                        # running it through the relevance filter (which
+                        # would almost always just reject it anyway).
+                        # Post-link discovery just below is unaffected -
+                        # it's still useful either way.
+                        if not product_name:
+                            for sel in ["span._aacl", "div._aacl", "h1", "span"]:
+                                for loc in page.locator(sel).all()[:50]:
+                                    try:
+                                        txt = loc.inner_text()
+                                        if txt and len(txt.split()) >= 6:
+                                            _add(txt)
+                                    except Exception:
+                                        pass
                         try:
                             for a in page.locator("a[href*='/p/'], a[href*='/reel/']").all()[:MAX_POSTS_TO_VISIT]:
                                 href = a.get_attribute("href")
@@ -1117,7 +1662,10 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
             # --- Visit individual posts (captioned embeds) to pick up
             # additional captions/top comments beyond the profile grid,
             # continuing until the cap is hit, the links run out, or we
-            # run low on time.
+            # run low on time. For a product-specific job, each post's
+            # caption is checked BEFORE spending time expanding its
+            # comments - only posts that are actually about this product
+            # get their comment threads expanded at all.
             for link in post_links:
                 if len(results) >= MAX_INSTAGRAM_COMMENTS or time_left() <= 4:
                     break
@@ -1137,20 +1685,56 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
                         post_embed, reason,
                     )
                     continue
-                before = len(results)
-                _expand_more_comments(page, time_left)
+
                 caption_loc, used_sel = _first_matching_locator(page, _CAPTION_SELECTOR_CHAIN)
+                caption_texts: List[str] = []
                 if caption_loc is not None:
                     for loc in caption_loc.all():
+                        try:
+                            caption_texts.append(loc.inner_text())
+                        except Exception:
+                            pass
+                try:
+                    peek_html = _content_bounded(page, 1500)
+                    peek_texts, _ = _parse_embed_context(peek_html)
+                except Exception:
+                    peek_texts = []
+
+                if product_name:
+                    relevant = any(
+                        _mentions_product(t, product_name)
+                        for t in caption_texts + peek_texts
+                    )
+                    if not relevant:
+                        logger.info(
+                            "Instagram scrape: post=%s does not mention "
+                            "product=%r; skipping (comments not expanded).",
+                            post_embed, product_name,
+                        )
+                        continue
+
+                before = len(results)
+                _expand_more_comments(page, time_left)
+                for t in caption_texts:
+                    _add(t)
+                for t in peek_texts:
+                    _add(t)
+                # Re-query after expansion: more comment nodes may now be
+                # attached under the same selector chain.
+                caption_loc2, _ = _first_matching_locator(page, _CAPTION_SELECTOR_CHAIN)
+                if caption_loc2 is not None:
+                    for loc in caption_loc2.all():
                         try:
                             _add(loc.inner_text())
                         except Exception:
                             pass
                 # Post embeds sometimes carry their own contextJSON payload
                 # (caption + preview comments) in the page source even when
-                # the rendered DOM shows nothing extractable.
+                # the rendered DOM shows nothing extractable, and expanding
+                # comments can add to it too.
                 try:
-                    post_texts, _ = _parse_embed_context(page.content())
+                    post_html = _content_bounded(page, 1500)
+                    post_texts, _ = _parse_embed_context(post_html)
                     for txt in post_texts:
                         _add(txt)
                 except Exception:
@@ -1162,9 +1746,14 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
                 )
 
             # --- One search fallback (single query), only if still short
-            # on data and there's time left ------------------------------
+            # on data and there's time left. Product-specific jobs narrow
+            # the query to that product so the snippets it finds (if any)
+            # are still on-topic. ------------------------------
             if len(results) < MIN_RESULTS_BEFORE_FALLBACK and time_left() > 4:
-                q = f'site:instagram.com "{company_name}"'
+                if product_name:
+                    q = f'site:instagram.com "{company_name}" "{product_name}"'
+                else:
+                    q = f'site:instagram.com "{company_name}"'
                 search_url = f"https://www.google.com/search?q={q.replace(' ', '+')}&hl=en&num=20"
                 if _goto_with_retry(page, search_url, timeout=_adaptive_nav_timeout(time_left), time_left=time_left):
                     try:
@@ -1177,7 +1766,7 @@ async def scrape_instagram_comments(company_data: Dict[str, str]) -> List[str]:
                                 "div.lyLwlc", "span.MUxGbd"]:
                         for loc in page.locator(sel).all()[:25]:
                             try:
-                                _add(loc.inner_text())
+                                _add_if_relevant(loc.inner_text())
                             except Exception:
                                 pass
 

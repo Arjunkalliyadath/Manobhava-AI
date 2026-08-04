@@ -1,23 +1,122 @@
+/*
+ * Module Name
+ * -----------
+ * static/style.css
+ *
+ * Purpose
+ * -------
+ * The single, shared design-token layer for every page in this app
+ * (index.html, select_products.html, dashboard.html). Before this file
+ * existed in practice, each template defined its own separate :root
+ * block with different values and even different token names — the
+ * three pages could visually drift from each other, and reportedly did.
+ * This file is now the one place the color palette, type scale, and
+ * spacing/radius/shadow scale live; each template links to it and
+ * builds its own page-specific layout/components on top using these
+ * tokens, rather than redefining them.
+ *
+ * Design direction
+ * -----------------
+ * A precision-instrument feel (Leica / Xiaomi / Apple, per the brief) —
+ * restrained neutrals, one considered accent used sparingly, and a
+ * monospace face reserved for real measurements (scores, percentages,
+ * counts) so numbers read as *measured*, not decorated. Deliberately
+ * not the near-cream + high-contrast-serif + terracotta combination
+ * this project's templates previously used — that combination is a
+ * common generic-AI-design default, not a choice made for this brand.
+ *
+ * Fonts are loaded via <link> tags in each template's own <head>
+ * (Space Grotesk for display, Inter for body/UI, IBM Plex Mono for
+ * data) — this file only declares the resulting font-family stacks.
+ *
+ * Responsibilities
+ * -----------------
+ * - Define the full color palette as CSS custom properties.
+ * - Define the type, spacing, radius, and shadow scales as custom
+ *   properties.
+ * - Provide a minimal, shared base reset and body/link defaults.
+ * - Nothing page-specific lives here — no component classes, no
+ *   layout rules. Those stay in each template, referencing these
+ *   tokens via var(...).
+ */
+
 :root {
   color-scheme: light;
-  font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  --bg: #f4f7fb;
-  --card: #ffffff;
-  --text: #14213d;
-  --muted: #5b6474;
-  --accent: #2563eb;
+
+  /* --- Core palette --- */
+  --ink:        #18170F;   /* primary text; also the dark nav/hero band */
+  --ink-soft:   #34322A;   /* lighter warm-charcoal, hover states on dark surfaces */
+  --paper:      #F7F6F2;   /* page background */
+  --surface:    #FFFFFF;   /* card background */
+  --border:     #E4E1D7;   /* hairline borders */
+  --muted:      #7C7666;   /* secondary text */
+  --muted-2:    #A79C86;   /* tertiary text / placeholders */
+
+  /* --- Signature accent: warm brass/copper, spent sparingly --- */
+  --accent:      #B8722E;
+  --accent-dark: #96591F;
+  --accent-soft: rgba(184, 114, 46, 0.12);
+
+  /* --- Sentiment colors (functional; kept distinct from --accent) --- */
+  --positive:      #2E7D4F;
+  --positive-soft: #E3F0E7;
+  --negative:      #B23B33;
+  --negative-soft: #F6E4E2;
+  --neutral:       #6B7280;
+  --neutral-soft:  #E8E9EC;
+
+  /* --- Back-compat aliases: earlier per-template token names, kept so
+     existing var(--x) references in template markup/CSS resolve to the
+     same palette above without a risky wholesale rename across three
+     large files. New code should prefer the names above. --- */
+  --bg:        var(--paper);
+  --text:      var(--ink);
+  --dark:      var(--ink);
+  --primary:   var(--accent);
+  --primary-l: var(--accent-soft);
+  --hairline:  var(--border);
+  --mark:      var(--accent-dark);
+
+  /* --- Type scale (font stacks only — weights/sizes set per element) --- */
+  --font-display: 'Space Grotesk', -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-body:    'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono:    'IBM Plex Mono', ui-monospace, "SFMono-Regular", Menlo, monospace;
+
+  /* --- Spacing / radius / shadow scale --- */
+  --r-sm: 10px;
+  --r-md: 14px;
+  --r-lg: 20px;
+  --shadow-sm: 0 1px 2px rgba(24,23,15,.05), 0 1px 1px rgba(24,23,15,.04);
+  --shadow-md: 0 8px 24px rgba(24,23,15,.07);
+  --shadow-lg: 0 20px 48px rgba(24,23,15,.10);
 }
-* { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--text); }
-.container, .dashboard { max-width: 1200px; margin: 0 auto; padding: 24px; display: grid; gap: 20px; }
-.card { background: var(--card); border-radius: 16px; padding: 24px; box-shadow: 0 10px 30px rgba(20, 33, 61, 0.08); }
-.hero { text-align: center; }
-.search-form { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin-top: 20px; }
-.search-form input { min-width: 280px; padding: 12px 16px; border: 1px solid #d4dce7; border-radius: 999px; }
-.search-form button, .downloads-card a { background: var(--accent); color: #fff; border: none; padding: 12px 18px; border-radius: 999px; cursor: pointer; text-decoration: none; }
-.stats-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
-.stats-grid div { background: #f8fafc; padding: 14px; border-radius: 12px; }
-.stats-grid span { display: block; color: var(--muted); font-size: 0.9rem; }
-table { width: 100%; border-collapse: collapse; }
-th, td { padding: 10px; border-bottom: 1px solid #e5eaf2; text-align: left; }
-@media (max-width: 760px) { .stats-grid { grid-template-columns: 1fr 1fr; } }
+
+*, *::before, *::after { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-body);
+  -webkit-font-smoothing: antialiased;
+}
+
+a { color: inherit; }
+
+/* Numerals throughout the product (scores, percentages, counts) render
+   in the monospace face — a deliberate, consistent signature rather
+   than a one-off effect. Apply via class="num" on the element wrapping
+   a measured value. */
+.num, .tnum {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

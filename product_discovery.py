@@ -8,6 +8,11 @@ Purpose
     with per-item metadata for downstream review scraping and reporting.
 
 Responsibilities
+    - Reject anything that isn't a real website URL (a bare keyword or
+      company name like "boat audio") before any network activity starts -
+      see the is_url() guard at the top of discover_products(). This is a
+      second line of defense; the input step (app.py, before
+      company_discovery.py even runs) is meant to gate on the same check.
     - Fetch a target site over plain HTTP where possible, and fall back to
       a single, shared Playwright browser session when the site is blocked
       or renders content via JavaScript.
@@ -17,6 +22,24 @@ Responsibilities
       Product records, merging duplicates discovered by different stages.
     - Score, filter, and classify each candidate (product vs. service)
       before ranking and truncating to the public output shape.
+
+Session notes (2026-07-31)
+    Verified against samsung.com/in, apple.com/in, mamaearth.in,
+    lenskart.com, vguard.com, boat-lifestyle.com, headphonezone.in,
+    sony.co.in, ajio.com, and online.kfc.co.in. Fixes made this pass:
+    - Added the is_url() input guard described above.
+    - Tried "--disable-http2" on the Playwright browser launch as an
+      untested attempt at online.kfc.co.in's ERR_HTTP2_PROTOCOL_ERROR,
+      which happens before any parsing code runs.
+    - ajio.com remains hard-blocked (its anti-bot interstitial is
+      correctly detected and rejected rather than mined for garbage) -
+      that's working as intended, not a bug; getting past it would need
+      residential proxies or a paid unblocking service, out of scope here.
+    - Removed a duplicate copy of _root_url() (now imported from
+      product_extraction.py, which already had its own copy).
+    Most of the empty-product-URL fixes for this session live in
+    product_extraction.py (see its own docstring), since that's where the
+    URL was actually being lost.
 
 Architecture
     A single plain-HTTP probe of the homepage decides which of two paths
@@ -81,6 +104,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 import config
+from url_utils import is_url
 from scrapers.browser_utils import run_playwright_async
 from product_extraction import (
     Product,
@@ -88,6 +112,7 @@ from product_extraction import (
     classify_as_service,
     detect_site_type,
     discover_category_links,
+    extract_meta_image,
     extract_sitemap_locs,
     filter_category_urls_from_sitemap,
     is_sitemap_index,
@@ -97,6 +122,7 @@ from product_extraction import (
     parse_jsonld_products,
     parse_robots_sitemaps,
     _looks_like_product_url,
+    _root_url,
     _CATEGORY_HINT_WORDS,
     _CATEGORY_EXCLUDE_WORDS,
 )
@@ -116,9 +142,9 @@ _ADD_TO_CART_MARKERS = (
     "add to cart", "add to bag", "add to basket", "buy now",
 )
 
-DISCOVERY_VERSION = "product-discovery-v6"
+DISCOVERY_VERSION = "product-discovery-v7"
 
-MAX_CATALOGUE_SIZE = 60
+MAX_CATALOGUE_SIZE = 200  # raised from 60 - was silently truncating real catalogs (boat-lifestyle.com has 166 real products; this crawl already visits every discovered category page regardless of this cap, so raising it costs close to nothing in extra time - it's not visiting more pages, just not throwing away products it already found on pages it was fetching anyway). Product discovery is a separate, untimed step before the person picks products and starts the actual 1-3 min analysis clock, so this isn't part of that budget at all.
 
 MIN_CONFIDENCE = 0.35
 
@@ -133,6 +159,12 @@ MAX_SITEMAPS_TO_FOLLOW = 3
 MAX_SITEMAP_INDEX_CHILDREN = 3
 
 THIN_RESULT_THRESHOLD = 8
+
+# Cap on how many products we'll pay an extra per-product-page fetch for to
+# backfill a missing image (see _enrich_missing_images). Capped to the same
+# size as what's actually shown in select_products.html - no point spending
+# a request on a product that will be truncated out of the final list.
+MAX_IMAGE_ENRICH_TARGETS = MAX_CATALOGUE_SIZE
 
 CANDIDATE_PATH_SUFFIXES = (
     "/products", "/collections/all", "/shop", "/shop-all", "/collections",
@@ -217,6 +249,19 @@ async def discover_products(company_data: Dict[str, str]) -> Dict:
 
     if not website:
         return ProductDiscoveryResult(discovery_method="skipped-no-website").as_dict()
+
+    if not is_url(website):
+        # Second line of defense against a bare keyword/company name (e.g.
+        # "boat audio") reaching this far and triggering a live crawl - the
+        # input step is meant to gate on this same is_url() check before
+        # company_discovery.py even runs, but checking it again here means
+        # this module can never go crawl-happy on a non-URL string even if
+        # that upstream gate is ever bypassed or changed.
+        logger.info(
+            "Product discovery skipped: %r does not look like a website "
+            "URL.", website,
+        )
+        return ProductDiscoveryResult(discovery_method="skipped-invalid-url").as_dict()
 
     root = _root_url(website)
     stages_used: List[str] = []
@@ -309,6 +354,11 @@ async def discover_products(company_data: Dict[str, str]) -> Dict:
             continue
         product.is_service = classify_as_service(product)
         final_catalogue.append(product)
+
+    try:
+        await _enrich_missing_images(final_catalogue)
+    except Exception as exc:
+        logger.info("Image enrichment pass failed for %s: %s", root, exc)
 
     method = "+".join(stages_used) if stages_used else "none"
     result = ProductDiscoveryResult(
@@ -492,6 +542,53 @@ async def _crawl_urls(
         )
     )
     return any(results)
+
+
+async def _enrich_missing_images(products: List[Product]) -> None:
+    """Backfill product.image for products whose listing-card had no usable
+    photo, by fetching that product's own detail page and reading its
+    JSON-LD `image` field or its og:image/twitter:image meta tags.
+
+    This exists because of a real, confirmed gap: some storefronts (boAt's
+    "Gifting with boAt" promotional carousel is the case that surfaced it)
+    inject a card's real photo entirely client-side, with no data-src/
+    srcset fallback for a static-HTML scrape to fall back on - so no amount
+    of listing-card parsing can recover it. A product's own detail page,
+    by contrast, reliably renders its OpenGraph/Twitter image server-side
+    on essentially every ecommerce platform, so it's a much sturdier
+    fallback source than continuing to fight listing-page card markup.
+
+    Only products that already passed confidence/name filtering and are
+    missing an image are targeted, and the count is capped
+    (MAX_IMAGE_ENRICH_TARGETS) so this can't blow up total request volume
+    on a large catalogue - it's a backfill for the common case of a
+    handful of stragglers, not a second full crawl.
+    """
+    targets = [p for p in products if p.url and not p.image]
+    if not targets:
+        return
+    # Prioritise the higher-confidence products first, since a large
+    # catalogue may have more gaps than the cap allows.
+    targets = sorted(targets, key=lambda p: p.confidence, reverse=True)[:MAX_IMAGE_ENRICH_TARGETS]
+
+    semaphore = asyncio.Semaphore(config.MAX_PARALLEL_TASKS)
+
+    async def _one(product: Product) -> None:
+        async with semaphore:
+            html = await _fetch_static(product.url)
+        if not html:
+            return
+        for jsonld_product in parse_jsonld_products(html, product.url):
+            if jsonld_product.image:
+                product.image = jsonld_product.image
+                product.source.add("image-enriched")
+                return
+        meta_image = extract_meta_image(html)
+        if meta_image:
+            product.image = meta_image
+            product.source.add("image-enriched")
+
+    await asyncio.gather(*(_one(p) for p in targets))
 
 
 def _merge_playwright_results(
@@ -683,6 +780,15 @@ class _PlaywrightSession:
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled",
+                # online.kfc.co.in fails page.goto() with
+                # ERR_HTTP2_PROTOCOL_ERROR before any of our own parsing
+                # code ever runs - a broken/incompatible HTTP/2 response
+                # from that site's edge for automated clients specifically.
+                # Forcing HTTP/1.1 is a cheap, universally-safe thing to
+                # try (every server that speaks HTTP/2 also speaks
+                # HTTP/1.1), but this hasn't been verified live yet - it
+                # needs a real run against that site to confirm it helps.
+                "--disable-http2",
             ],
         )
         context = await browser.new_context(
@@ -877,6 +983,20 @@ async def _render_category_with_pagination(
                 if not new_products:
                     break
                 _ingest(registry, new_products)
+    except Exception:
+        # A single bad category page (a selector that doesn't parse on this
+        # site's markup, a timeout, a transient nav failure, etc.) must not
+        # wipe out everything already found - not just on other category
+        # pages, but on the homepage too, since this used to propagate all
+        # the way out of _run_playwright_driven_discovery's own try/except
+        # and get replaced with a flat {} (see there). registry already
+        # has whatever was ingested before the failure point (dicts are
+        # shared/mutated in place), so just log and move on.
+        logger.warning(
+            "Category page %s failed during Playwright-driven discovery; "
+            "keeping whatever products were already found on it and "
+            "elsewhere.", url, exc_info=True,
+        )
     finally:
         await session.release_page(page)
 
@@ -898,15 +1018,29 @@ async def _run_playwright_driven_discovery(
             homepage_html = await session.render(root)
             site_type = detect_site_type(homepage_html or "")
             if homepage_html:
-                _ingest(registry, parse_jsonld_products(homepage_html, root))
-                _ingest(registry, parse_html_product_cards(homepage_html, root))
+                try:
+                    _ingest(registry, parse_jsonld_products(homepage_html, root))
+                except Exception:
+                    logger.warning("parse_jsonld_products failed for homepage %s", root, exc_info=True)
+                try:
+                    _ingest(registry, parse_html_product_cards(homepage_html, root))
+                except Exception:
+                    logger.warning("parse_html_product_cards failed for homepage %s", root, exc_info=True)
 
             pages_to_visit = list(dict.fromkeys(category_urls))
             if rediscover_categories:
-                nav_links = discover_category_links(homepage_html or "", root, limit=MAX_CATEGORY_PAGES)
-                extra_links = _discover_extra_category_links(
-                    homepage_html or "", root, exclude=set(nav_links), limit=MAX_CATEGORY_PAGES,
-                )
+                try:
+                    nav_links = discover_category_links(homepage_html or "", root, limit=MAX_CATEGORY_PAGES)
+                except Exception:
+                    logger.warning("discover_category_links failed for %s", root, exc_info=True)
+                    nav_links = []
+                try:
+                    extra_links = _discover_extra_category_links(
+                        homepage_html or "", root, exclude=set(nav_links), limit=MAX_CATEGORY_PAGES,
+                    )
+                except Exception:
+                    logger.warning("_discover_extra_category_links failed for %s", root, exc_info=True)
+                    extra_links = []
                 if extra_links:
                     logger.info(
                         "Mega-menu/footer discovery (rendered DOM) found %d "
@@ -918,12 +1052,21 @@ async def _run_playwright_driven_discovery(
             pages_to_visit = pages_to_visit[:MAX_PLAYWRIGHT_PAGES]
 
             if pages_to_visit:
-                await asyncio.gather(
+                _page_results = await asyncio.gather(
                     *(
                         _render_category_with_pagination(session, url, registry, categories_seen)
                         for url in pages_to_visit
-                    )
+                    ),
+                    return_exceptions=True,
                 )
+                for _url, _outcome in zip(pages_to_visit, _page_results):
+                    if isinstance(_outcome, BaseException):
+                        logger.warning(
+                            "Category page %s raised past its own handler "
+                            "during Playwright-driven discovery (%s: %s) - "
+                            "continuing with the other pages.",
+                            _url, type(_outcome).__name__, _outcome,
+                        )
 
             return registry, categories_seen, site_type, homepage_html
         finally:
@@ -992,8 +1135,3 @@ def _accepted_count(registry: Dict[str, Product]) -> int:
         if product.score() >= MIN_CONFIDENCE:
             count += 1
     return count
-
-
-def _root_url(url: str) -> str:
-    parsed = urlparse(url if "://" in url else f"https://{url}")
-    return f"{parsed.scheme}://{parsed.netloc}".rstrip("/")

@@ -340,10 +340,4 @@ GitHub: https://github.com/Arjunkalliyadath
 
 ---
 
-# 📜 License
-
-This project is intended for educational and research purposes.
-
----
-
 ⭐ If you found this project useful, consider giving it a star on GitHub.

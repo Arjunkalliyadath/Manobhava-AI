@@ -153,9 +153,9 @@ from aspect_intelligence import build_aspect_intelligence_by_product
 from sentiment import analyze_sentiment_batch, get_sentiment_pipeline
 from url_utils import derive_company_name, is_url, normalize_url
 from utils import clean_comment, normalize_text, remove_links, unique_comments
-from scrapers.google_scraper import scrape_google_reviews
-from scrapers.twitter_scraper import scrape_twitter_comments
-from scrapers.instagram_scraper import scrape_instagram_comments
+from scrapers.google_scraper import scrape_google_reviews, scrape_google_product_reviews
+from scrapers.twitter_scraper import scrape_twitter_comments, MAX_BROWSER_WORKERS as MAX_TWITTER_WORKERS
+from scrapers.instagram_scraper import scrape_instagram_comments, MAX_BROWSER_WORKERS as MAX_INSTAGRAM_WORKERS
 from scrapers.youtube_scraper import scrape_youtube_comments, MAX_BROWSER_WORKERS
 from scrapers.reddit_scraper import scrape_reddit_comments, MAX_REDDIT_WORKERS
 from scrapers.website_review_scraper import scrape_website_reviews, MAX_WORKERS as MAX_WEBSITE_REVIEW_WORKERS
@@ -297,6 +297,19 @@ def _make_pipeline_profiler():
 
 
 @app.post("/analyze")
+# NOTE (flagged, not removed — needs a decision, not a guess): exhaustive
+# search of every template in this project (index.html, select_products.html,
+# dashboard.html) found no <form>, fetch(), or link that submits to this
+# route. /discover_products -> /analyze_selected appears to be the only
+# path the shipped UI actually uses; this route and /analyze_selected have
+# independently drifted at least once already (see the youtube job-group
+# sort fix applied to both copies this session). If nothing outside this
+# repository calls /analyze directly, it — and the ~900 duplicated lines
+# it shares with /analyze_selected — is a strong candidate for deletion in
+# a focused follow-up. Not removed here: that can't be fully ruled out
+# from static code alone, and deleting a live route on a "production-grade"
+# app deserves an explicit decision, not an assumption. See ARCHITECTURE.md
+# for the fuller history of this finding.
 async def analyze(request: Request, company_name: str = Form(...)):
     _log_stage, _timed, _log_total_and_breakdown = _make_pipeline_profiler()
 
@@ -389,9 +402,18 @@ async def analyze(request: Request, company_name: str = Form(...)):
                     "products": rich_products[: config.MAX_PRODUCTS],
                     "website": normalized_website,
                     "company": company_data,
+                    "max_selectable": config.MAX_SELECTABLE_PRODUCTS,
                 },
             )
         scrape_targets: List[str] = product_data.get("scrape_targets", [])
+        if len(scrape_targets) > config.MAX_SELECTABLE_PRODUCTS:
+            logger.warning(
+                "analyze (auto-flow): %d auto-selected product(s) exceeds "
+                "MAX_SELECTABLE_PRODUCTS=%d; truncating to keep the "
+                "analysis inside its time budget.",
+                len(scrape_targets), config.MAX_SELECTABLE_PRODUCTS,
+            )
+            scrape_targets = scrape_targets[: config.MAX_SELECTABLE_PRODUCTS]
         logger.info(
             "Product discovery: %d products, %d services, scrape_targets=%s (method=%s)",
             product_data.get("products_found", 0),
@@ -400,10 +422,20 @@ async def analyze(request: Request, company_name: str = Form(...)):
             product_data.get("discovery_method"),
         )
 
+        # "General" runs the real (business-wide) Maps scrape via
+        # scrape_google_reviews. Every other job here is routed to
+        # scrape_google_product_reviews instead (see _scrape_google_job
+        # below) - a genuinely product-specific search-snippet scrape that
+        # is never cached/shared across products, unlike Maps reviews.
+        # product_name is kept as its own field (not appended onto
+        # company_name) so scrape_google_product_reviews can build its own
+        # query and so this job's data never accidentally collides with
+        # the "General" job's Maps cache key (which is keyed on website/
+        # company_name only).
         google_jobs: List[Dict[str, Any]] = [{"label": "General", "data": company_data}]
         for product in scrape_targets:
             product_company_data = dict(company_data)
-            product_company_data["company_name"] = f"{company_data['company_name']} {product}"
+            product_company_data["product_name"] = product
             google_jobs.append({"label": product, "data": product_company_data})
 
         youtube_jobs: List[Dict[str, Any]] = [{"label": "General", "data": company_data}]
@@ -412,11 +444,51 @@ async def analyze(request: Request, company_name: str = Form(...)):
             yt_product_data["product_name"] = product
             youtube_jobs.append({"label": product, "data": yt_product_data})
 
+        # FIX: /analyze_selected already wires product_brand through to Reddit
+        # jobs (it has real Product objects with a .brand attribute); this
+        # auto-flow route only had plain product-name strings in
+        # scrape_targets, so reddit_scraper.py's Priority-2 tier
+        # (_build_search_tiers) always fell back to its generic
+        # "<product> Reddit" phrasing here, even for a multi-brand retailer
+        # where the manufacturer's brand differs from the site's own company
+        # name - see that function's own docstring for why this distinction
+        # matters. The brand field already exists per catalogue item (see
+        # the rich_products block above and catalogue_url_by_name below) -
+        # it just wasn't being looked up for the scraper jobs.
+        catalogue_brand_by_name: Dict[str, str] = {}
+        for item in product_data.get("catalogue", []):
+            item_name = (item.get("name") or "").strip()
+            item_brand = (item.get("brand") or "").strip()
+            if item_name and item_brand:
+                catalogue_brand_by_name.setdefault(item_name, item_brand)
+
         reddit_jobs: List[Dict[str, Any]] = [{"label": "General", "data": company_data}]
         for product in scrape_targets:
             reddit_product_data = dict(company_data)
             reddit_product_data["product_name"] = product
+            reddit_product_data["product_brand"] = catalogue_brand_by_name.get(product, "")
             reddit_jobs.append({"label": product, "data": reddit_product_data})
+
+        # "General" keeps the old brand-wide-timeline/whole-profile
+        # behaviour. Every other job is a genuinely product-specific
+        # scrape (search attempt, then profile/post content filtered down
+        # to what actually mentions the product) - see the PRODUCT-
+        # SPECIFIC handling inside scrape_twitter_comments/
+        # scrape_instagram_comments for details. Previously these two
+        # platforms were called ONCE per whole analysis (not per product)
+        # and every comment from them was labeled "General" regardless of
+        # which product was selected.
+        twitter_jobs: List[Dict[str, Any]] = [{"label": "General", "data": company_data}]
+        for product in scrape_targets:
+            twitter_product_data = dict(company_data)
+            twitter_product_data["product_name"] = product
+            twitter_jobs.append({"label": product, "data": twitter_product_data})
+
+        instagram_jobs: List[Dict[str, Any]] = [{"label": "General", "data": company_data}]
+        for product in scrape_targets:
+            instagram_product_data = dict(company_data)
+            instagram_product_data["product_name"] = product
+            instagram_jobs.append({"label": product, "data": instagram_product_data})
 
         # Website review jobs — previously only /analyze_selected ran these,
         # so any site with few enough products to skip the selection screen
@@ -433,6 +505,12 @@ async def analyze(request: Request, company_name: str = Form(...)):
         for product in scrape_targets:
             product_url = catalogue_url_by_name.get(product, "")
             if not product_url:
+                logger.warning(
+                    "Website review job SKIPPED for %r: no product URL found "
+                    "in the catalogue, so there is nothing genuinely "
+                    "product-specific to scrape here.",
+                    product,
+                )
                 continue
             website_review_data = dict(company_data)
             website_review_data["product_url"] = product_url
@@ -443,38 +521,110 @@ async def analyze(request: Request, company_name: str = Form(...)):
         youtube_semaphore = asyncio.Semaphore(MAX_BROWSER_WORKERS)
         reddit_semaphore = asyncio.Semaphore(MAX_REDDIT_WORKERS)
         website_review_semaphore = asyncio.Semaphore(MAX_WEBSITE_REVIEW_WORKERS)
+        twitter_semaphore = asyncio.Semaphore(MAX_TWITTER_WORKERS)
+        instagram_semaphore = asyncio.Semaphore(MAX_INSTAGRAM_WORKERS)
 
-        GOOGLE_JOB_TIMEOUT_SECONDS = 48
-        TWITTER_TIMEOUT_SECONDS = 32
-        INSTAGRAM_TIMEOUT_SECONDS = 34
-        YOUTUBE_TIMEOUT_SECONDS = 30
-        REDDIT_TIMEOUT_SECONDS = 20
-        WEBSITE_REVIEW_TIMEOUT_SECONDS = 60
+        # VALUE HISTORY: originally 48s. Raised to 90s on the reasoning
+        # that Google Reviews is scraped at most ONCE per business per run
+        # (see scrape_google_reviews()'s single-flight cache in
+        # google_scraper.py), not once per selected product, so a bigger
+        # timeout was a one-time cost per analysis, not a multiplied one -
+        # and the old 48s ceiling was itself why review volume was low
+        # even for genuinely popular products (browser setup + Maps
+        # navigation + Reviews-tab detection routinely ate most of that
+        # budget, leaving only ~10-20s for the scroll loop that actually
+        # collects reviews). This also raised the ceiling on the
+        # "Collecting Reviews" stage as a whole, since
+        # results = await asyncio.gather(...) below waits for the slowest
+        # platform branch. Subsequently CUT to the current 45s once the
+        # whole-pipeline 1-3 minute ceiling took priority over Google's
+        # one-time cost being individually affordable - a 90s stage is
+        # still a large fraction of a 180s total budget even though it
+        # only happens once per run. Must stay in sync with
+        # OUTER_HARD_TIMEOUT_SECONDS in google_scraper.py (that value
+        # anchors this scraper's own internal deadline to the same
+        # job-start clock this wait_for counts against) - if one changes,
+        # so must the other, or the scrape can be cancelled here
+        # mid-flight with nothing to show for it.
+        GOOGLE_JOB_TIMEOUT_SECONDS = 45  # cut from 90 (itself raised from 48) - kept in sync with google_scraper.py OUTER_HARD_TIMEOUT_SECONDS
+        TWITTER_TIMEOUT_SECONDS = 45  # must be kept in sync with twitter_scraper.py OUTER_HARD_TIMEOUT_SECONDS
+        # PREVIOUS GAP: unlike YOUTUBE_TIMEOUT_SECONDS/REDDIT_TIMEOUT_SECONDS
+        # just below, Twitter had no General/per-product split at all - the
+        # brand-wide "General" job silently got the same 45s as a genuine
+        # per-product job, contradicting cross-cutting principle #1
+        # (ARCHITECTURE.md §3: General is lower-priority than per-product).
+        # With MAX_BROWSER_WORKERS=3 threads shared across up to 4 jobs
+        # (General + up to 3 selected products), a General job using its
+        # full budget competed for a real OS thread exactly as long as a
+        # job that actually matters. Must be kept equal to
+        # twitter_scraper.py's own GENERAL_OUTER_HARD_TIMEOUT_SECONDS - per
+        # that file's comment, shortening app.py's wait_for alone doesn't
+        # help (asyncio.wait_for can't stop the underlying Playwright
+        # thread - see §8), so the scraper's own internal deadline had to
+        # shrink too for this to do anything real.
+        GENERAL_TWITTER_TIMEOUT_SECONDS = 25  # the brand-wide "General" job only, not per-product jobs - see _scrape_twitter_job's comment
+        INSTAGRAM_TIMEOUT_SECONDS = 30  # cut from 45 - kept in sync with instagram_scraper.py OUTER_HARD_TIMEOUT_SECONDS
+        # Raised 30s -> 620s. Production logs showed 30s was only ever enough
+        # time for ONE candidate video per product before the outer deadline
+        # hit - nowhere near enough for hundreds/thousands of comments across
+        # many videos. Must stay in sync with OUTER_HARD_TIMEOUT_SECONDS in
+        # youtube_scraper.py (620 = that scraper's 600s internal deadline +
+        # a slice of margin for the result to propagate back through
+        # run_in_executor()/wait_for()).
+        YOUTUBE_TIMEOUT_SECONDS = 100  # cut from 620 - kept in sync with youtube_scraper.py OUTER_HARD_TIMEOUT_SECONDS (90) plus buffer
+        GENERAL_YOUTUBE_TIMEOUT_SECONDS = 25  # the brand-wide "General" job only, not per-product jobs - see _scrape_youtube_job's comment
+        # Raised 20 -> 90 to match reddit_scraper.py's TIME_BUDGET_SECONDS=80
+        # (was a 2s margin, sized for the old 60-comment/single-tier behavior -
+        # production logs showed real completions at 22.8s, already past both
+        # the old internal and outer caps, silently discarding real results).
+        REDDIT_TIMEOUT_SECONDS = 50  # cut from 90 - kept in sync with reddit_scraper.py TIME_BUDGET_SECONDS (40) plus buffer
+        GENERAL_REDDIT_TIMEOUT_SECONDS = 20  # the brand-wide "General" job only, not per-product jobs - see _scrape_reddit_job's comment
+        # website_review_scraper.py's numbers have moved a few times (MAX_REVIEWS
+        # and WIDGET_PAGINATE_TIME_BUDGET_SECONDS both went up for a "1000+
+        # genuine reviews" pass, then both came back down - 30 reviews,
+        # WIDGET_PAGINATE_TIME_BUDGET_SECONDS=30 - once priority shifted to the
+        # 3-min total pipeline ceiling; see that file's own comments for the
+        # current numbers, since duplicating them here is exactly how the two
+        # went out of sync before). Current worst case inside that file:
+        # TIME_BUDGET_SECONDS (30, sync HTTP) + PLAYWRIGHT_TIME_BUDGET_SECONDS
+        # (20, 503 fallback fetch) + WIDGET_PAGINATE_TIME_BUDGET_SECONDS +
+        # WIDGET_PAGINATE_SETUP_ALLOWANCE_SECONDS (30+35=65, widget-click
+        # pagination, now that its setup time is no longer silently counted
+        # against the click-budget) = 115s. This is 130, a 15s buffer on top.
+        WEBSITE_REVIEW_TIMEOUT_SECONDS = 130  # widened from 90 (stale 30+20+30=80s estimate) - see comment above
 
         async def _scrape_google_job(job: Dict[str, Any]) -> List[str]:
+            # "General" = real Google Maps business-wide reviews (cached,
+            # single-flight across the whole run). Every other label is a
+            # genuinely product-specific search-snippet scrape instead -
+            # see scrape_google_product_reviews()'s docstring for why Maps
+            # itself is skipped for those.
+            is_general = job.get("label") == "General"
             async with google_semaphore:
                 try:
-                    return await asyncio.wait_for(
-                        scrape_google_reviews(job["data"]),
-                        timeout=GOOGLE_JOB_TIMEOUT_SECONDS,
-                    )
+                    if is_general:
+                        coro = scrape_google_reviews(job["data"])
+                    else:
+                        coro = scrape_google_product_reviews(job["data"])
+                    return await asyncio.wait_for(coro, timeout=GOOGLE_JOB_TIMEOUT_SECONDS)
                 except asyncio.TimeoutError:
                     logger.warning(
-                        "Google Reviews job for %r exceeded its %.0fs hard "
+                        "Google %s job for %r exceeded its %.0fs hard "
                         "timeout — no partial results are recoverable here "
                         "(asyncio.wait_for cancels the awaited coroutine on "
                         "timeout and this returns []); any in-progress "
-                        "background scrape may still finish and populate "
-                        "the cache for a later request, see "
-                        "scrape_google_reviews()'s own logging for that.",
+                        "background scrape may still finish (and, for the "
+                        "General/Maps job, populate the cache for a later "
+                        "request).",
+                        "Maps" if is_general else "Product Search",
                         job.get("label"), GOOGLE_JOB_TIMEOUT_SECONDS,
                     )
                     return []
                 except asyncio.CancelledError:
-                    logger.warning("Google Reviews job for %r was cancelled", job.get("label"))
+                    logger.warning("Google job for %r was cancelled", job.get("label"))
                     return []
                 except Exception:
-                    logger.exception("Google Reviews job for %r failed", job.get("label"))
+                    logger.exception("Google job for %r failed", job.get("label"))
                     return []
 
         async def _scrape_google_jobs_group() -> List[Any]:
@@ -488,11 +638,23 @@ async def analyze(request: Request, company_name: str = Form(...)):
                 _log_stage("Google Review Collection", time.perf_counter() - _group_start)
 
         async def _scrape_youtube_job(job: Dict[str, Any]) -> List[str]:
+            # The "General" job is brand-wide, not product-specific - lower
+            # priority than the per-product jobs per the person's own stated
+            # preference (genuine product-based comments first). Live log:
+            # it was routinely using its full budget to pull a full 100
+            # comments via a generic "channel_name_search" fallback, adding
+            # real volume/sentiment-analysis time for the platform's least
+            # important bucket. A much shorter budget still gets a real
+            # (if smaller) sample when one's available, without costing the
+            # product-specific jobs anything - it has its own semaphore
+            # slot regardless of how long it runs.
+            is_general = job.get("label") == "General"
+            job_timeout = GENERAL_YOUTUBE_TIMEOUT_SECONDS if is_general else YOUTUBE_TIMEOUT_SECONDS
             async with youtube_semaphore:
                 try:
                     return await asyncio.wait_for(
                         scrape_youtube_comments(job["data"]),
-                        timeout=YOUTUBE_TIMEOUT_SECONDS,
+                        timeout=job_timeout,
                     )
                 except asyncio.TimeoutError:
                     logger.warning(
@@ -503,7 +665,7 @@ async def analyze(request: Request, company_name: str = Form(...)):
                         "synchronous Playwright work keeps running to "
                         "completion in the background, unseen, holding a "
                         "browser-worker slot until it finishes on its own).",
-                        job.get("label"), YOUTUBE_TIMEOUT_SECONDS,
+                        job.get("label"), job_timeout,
                     )
                     return []
                 except asyncio.CancelledError:
@@ -524,7 +686,18 @@ async def analyze(request: Request, company_name: str = Form(...)):
                 _log_stage("YouTube Scraper", time.perf_counter() - _group_start)
             seen_keys: set = set()
             by_product: List[Dict[str, Any]] = []
-            for job, outcome in zip(youtube_jobs, per_job_results):
+            # FIX: sort General (brand-wide) behind product-specific jobs
+            # before dedup — same pattern as _scrape_reddit_jobs_group() just
+            # below. Without it, a comment surfaced by both a product-specific
+            # search and the brand-wide "General" search is claimed by
+            # whichever is processed first; youtube_jobs lists General first,
+            # so it used to win and a genuine product-specific comment was
+            # dropped as a "duplicate" instead of kept under its real product.
+            # See ARCHITECTURE.md §4.8 / §0 item 9.
+            for job, outcome in sorted(
+                zip(youtube_jobs, per_job_results),
+                key=lambda pair: pair[0]["label"] == "General",
+            ):
                 comments = list(outcome) if not isinstance(outcome, BaseException) else []
                 deduped: List[str] = []
                 for c in comments:
@@ -537,18 +710,24 @@ async def analyze(request: Request, company_name: str = Form(...)):
             return by_product
 
         async def _scrape_reddit_job(job: Dict[str, Any]) -> List[str]:
+            # Same reasoning as _scrape_youtube_job just above: "General" is
+            # brand-wide, lower priority than product-specific per the
+            # person's own stated preference, and Reddit is httpx-based/
+            # cheap so a much shorter budget still gets a real sample.
+            is_general = job.get("label") == "General"
+            job_timeout = GENERAL_REDDIT_TIMEOUT_SECONDS if is_general else REDDIT_TIMEOUT_SECONDS
             async with reddit_semaphore:
                 try:
                     return await asyncio.wait_for(
                         scrape_reddit_comments(job["data"]),
-                        timeout=REDDIT_TIMEOUT_SECONDS,
+                        timeout=job_timeout,
                     )
                 except asyncio.TimeoutError:
                     logger.warning(
                         "Reddit Scraper job for %r exceeded its %.0fs hard "
                         "timeout — returning [] (no partial results are "
                         "recoverable here).",
-                        job.get("label"), REDDIT_TIMEOUT_SECONDS,
+                        job.get("label"), job_timeout,
                     )
                     return []
                 except asyncio.CancelledError:
@@ -569,7 +748,125 @@ async def analyze(request: Request, company_name: str = Form(...)):
                 _log_stage("Reddit Scraper", time.perf_counter() - _group_start)
             seen_keys: set = set()
             by_product: List[Dict[str, Any]] = []
-            for job, outcome in zip(reddit_jobs, per_job_results):
+            # FIX: process specific-product jobs before "General" here too -
+            # same pattern as comment_product_lookup's sort a few hundred
+            # lines below for Google/Twitter/Instagram. reddit_jobs always
+            # has "General" first (see its construction above), and this
+            # loop used to iterate in that raw order - so whenever General's
+            # single company-name-only search happened to surface the same
+            # comment a specific product's search also found (realistic,
+            # not just theoretical: the company_product tier is literally
+            # "<company> <product>", a superset of General's own query),
+            # General claimed it first and the product-specific occurrence
+            # was removed outright as a "duplicate", not merely relabeled -
+            # permanently dropping a genuine product-specific comment from
+            # that product's results. Sorting General to the end lets a real
+            # product claim a shared comment first, exactly like the
+            # Google/Twitter/Instagram fix already does.
+            for job, outcome in sorted(
+                zip(reddit_jobs, per_job_results),
+                key=lambda pair: pair[0]["label"] == "General",
+            ):
+                comments = list(outcome) if not isinstance(outcome, BaseException) else []
+                deduped: List[str] = []
+                for c in comments:
+                    key = c.strip().lower()
+                    if not key or key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    deduped.append(c)
+                by_product.append({"product": job["label"], "comments": deduped})
+            return by_product
+
+        async def _scrape_twitter_job(job: Dict[str, Any]) -> List[str]:
+            # Same reasoning as _scrape_reddit_job/_scrape_youtube_job above:
+            # "General" is brand-wide and lower priority than a genuine
+            # per-product job. Unlike Reddit, Twitter is still browser-based
+            # for this fallback, so the saving comes from twitter_scraper.py
+            # itself cutting its OWN internal deadline short for General
+            # (see GENERAL_OUTER_HARD_TIMEOUT_SECONDS there) - this outer
+            # timeout only needs to stay >= that value so app.py doesn't cut
+            # the coroutine off before the scraper's own graceful return.
+            is_general = job.get("label") == "General"
+            job_timeout = GENERAL_TWITTER_TIMEOUT_SECONDS if is_general else TWITTER_TIMEOUT_SECONDS
+            async with twitter_semaphore:
+                try:
+                    return await asyncio.wait_for(
+                        scrape_twitter_comments(job["data"]),
+                        timeout=job_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Twitter Scraper job for %r exceeded its %.0fs hard "
+                        "timeout — returning [] (no partial results are "
+                        "recoverable here).",
+                        job.get("label"), job_timeout,
+                    )
+                    return []
+                except asyncio.CancelledError:
+                    logger.warning("Twitter Scraper job for %r was cancelled", job.get("label"))
+                    return []
+                except Exception:
+                    logger.exception("Twitter Scraper job for %r failed", job.get("label"))
+                    return []
+
+        async def _scrape_twitter_jobs_group() -> List[Dict[str, Any]]:
+            _group_start = time.perf_counter()
+            try:
+                per_job_results = await asyncio.gather(
+                    *(_scrape_twitter_job(job) for job in twitter_jobs),
+                    return_exceptions=True,
+                )
+            finally:
+                _log_stage("Twitter Scraper", time.perf_counter() - _group_start)
+            seen_keys: set = set()
+            by_product: List[Dict[str, Any]] = []
+            for job, outcome in zip(twitter_jobs, per_job_results):
+                comments = list(outcome) if not isinstance(outcome, BaseException) else []
+                deduped: List[str] = []
+                for c in comments:
+                    key = c.strip().lower()
+                    if not key or key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    deduped.append(c)
+                by_product.append({"product": job["label"], "comments": deduped})
+            return by_product
+
+        async def _scrape_instagram_job(job: Dict[str, Any]) -> List[str]:
+            async with instagram_semaphore:
+                try:
+                    return await asyncio.wait_for(
+                        scrape_instagram_comments(job["data"]),
+                        timeout=INSTAGRAM_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Instagram Scraper job for %r exceeded its %.0fs hard "
+                        "timeout — returning [] (no partial results are "
+                        "recoverable here).",
+                        job.get("label"), INSTAGRAM_TIMEOUT_SECONDS,
+                    )
+                    return []
+                except asyncio.CancelledError:
+                    logger.warning("Instagram Scraper job for %r was cancelled", job.get("label"))
+                    return []
+                except Exception:
+                    logger.exception("Instagram Scraper job for %r failed", job.get("label"))
+                    return []
+
+        async def _scrape_instagram_jobs_group() -> List[Dict[str, Any]]:
+            _group_start = time.perf_counter()
+            try:
+                per_job_results = await asyncio.gather(
+                    *(_scrape_instagram_job(job) for job in instagram_jobs),
+                    return_exceptions=True,
+                )
+            finally:
+                _log_stage("Instagram Scraper", time.perf_counter() - _group_start)
+            seen_keys: set = set()
+            by_product: List[Dict[str, Any]] = []
+            for job, outcome in zip(instagram_jobs, per_job_results):
                 comments = list(outcome) if not isinstance(outcome, BaseException) else []
                 deduped: List[str] = []
                 for c in comments:
@@ -615,8 +912,8 @@ async def analyze(request: Request, company_name: str = Form(...)):
 
         results = await asyncio.gather(
             _scrape_google_jobs_group(),
-            _timed("Twitter Scraper", scrape_twitter_comments(company_data), timeout=TWITTER_TIMEOUT_SECONDS),
-            _timed("Instagram Scraper", scrape_instagram_comments(company_data), timeout=INSTAGRAM_TIMEOUT_SECONDS),
+            _scrape_twitter_jobs_group(),
+            _scrape_instagram_jobs_group(),
             _scrape_youtube_jobs_group(),
             _scrape_reddit_jobs_group(),
             _scrape_website_review_jobs_group(),
@@ -624,16 +921,29 @@ async def analyze(request: Request, company_name: str = Form(...)):
         )
 
         google_results = results[0]
-        twitter_comments, instagram_comments = results[1], results[2]
+        twitter_by_product: List[Dict[str, Any]] = results[1] if not isinstance(results[1], BaseException) else []
+        instagram_by_product: List[Dict[str, Any]] = results[2] if not isinstance(results[2], BaseException) else []
         youtube_by_product: List[Dict[str, Any]] = results[3] if not isinstance(results[3], BaseException) else []
         reddit_by_product: List[Dict[str, Any]] = results[4] if not isinstance(results[4], BaseException) else []
         website_review_job_results = results[5] if not isinstance(results[5], BaseException) else []
 
+        # FIX: removed the config.MAX_COMMENTS_PER_PRODUCT (20) slice that
+        # used to sit here. It ran AFTER scrape_website_reviews() already
+        # finished collecting for this job, so it saved zero scrape time -
+        # the only effect was silently discarding genuine, already-paid-for
+        # reviews down to 20/product. That's the opposite of "collect as
+        # much real data as the time budget allows" (ARCHITECTURE.md §3),
+        # and worst specifically for Website Review, whose widget-pagination
+        # work exists precisely to get past a trivial first-page count.
+        # WEBSITE_REVIEW_TIMEOUT_SECONDS above (not a post-hoc slice) is the
+        # actual time-budget guard, same as every other platform below.
+        # config.MAX_COMMENTS_PER_PRODUCT is left defined in config.py in
+        # case another module still reads it - just no longer referenced
+        # here or in the matching Google slice a few lines down.
         website_review_texts: List["tuple[str, str]"] = []
         _seen_website_review_keys: set = set()
         for job, outcome in zip(website_review_jobs, website_review_job_results):
             comments = list(outcome) if not isinstance(outcome, BaseException) else []
-            comments = comments[:config.MAX_COMMENTS_PER_PRODUCT]
             for text in comments:
                 text = (text or "").strip()
                 if not text:
@@ -644,11 +954,16 @@ async def analyze(request: Request, company_name: str = Form(...)):
                 _seen_website_review_keys.add(key)
                 website_review_texts.append((job["label"], text))
 
+        # FIX: same config.MAX_COMMENTS_PER_PRODUCT slice removed here as
+        # for Website Review (see that comment for the full reasoning) - it
+        # ran after the scrape already finished, saved no time, and only
+        # discarded results. google_scraper.py's own MAX_GOOGLE_REVIEWS cap
+        # (config.py) plus GOOGLE_JOB_TIMEOUT_SECONDS above already govern
+        # volume here, same as every other platform.
         google_by_product: List[Dict[str, Any]] = []
         google_all_comments: List[str] = []
         for job, outcome in zip(google_jobs, google_results):
             comments = list(outcome) if not isinstance(outcome, BaseException) else []
-            comments = comments[:config.MAX_COMMENTS_PER_PRODUCT]
             google_by_product.append({"product": job["label"], "comments": comments})
             google_all_comments.extend(comments)
 
@@ -660,29 +975,74 @@ async def analyze(request: Request, company_name: str = Form(...)):
         for entry in reddit_by_product:
             reddit_all_comments.extend(entry["comments"])
 
+        twitter_all_comments: List[str] = []
+        for entry in twitter_by_product:
+            twitter_all_comments.extend(entry["comments"])
+
+        instagram_all_comments: List[str] = []
+        for entry in instagram_by_product:
+            instagram_all_comments.extend(entry["comments"])
+
         platform_comments = {
             "Google":    google_all_comments,
-            "Twitter":   list(twitter_comments)   if not isinstance(twitter_comments,   BaseException) else [],
-            "Instagram": list(instagram_comments) if not isinstance(instagram_comments, BaseException) else [],
+            "Twitter":   twitter_all_comments,
+            "Instagram": instagram_all_comments,
             "YouTube":   youtube_all_comments,
             "Reddit":    reddit_all_comments,
             "Website":   [text for _, text in website_review_texts],
         }
 
         comment_product_lookup: Dict[str, str] = {}
-        for entry in google_by_product:
+        # FIX: process specific-product Google jobs before the "General" business-level job,
+        # so setdefault lets a real product claim a shared/duplicate review before "General" does.
+        for entry in sorted(google_by_product, key=lambda e: e["product"] == "General"):
             for comment in entry["comments"]:
                 comment_product_lookup.setdefault(comment, entry["product"])
 
         youtube_product_lookup: Dict[str, str] = {}
-        for entry in youtube_by_product:
+        # FIX: same ordering bug as Google above, just found here too -
+        # process specific-product YouTube jobs before the "General"
+        # brand-wide job, so setdefault lets a real product claim a
+        # shared/duplicate comment before "General" does. Without this, a
+        # comment a per-product job genuinely found on a product-specific
+        # video could still get silently attributed to "General" instead
+        # (and therefore dropped from that product's own dashboard card -
+        # see _split_product_and_brand_rows) whenever the exact same
+        # comment text also happened to surface via the General job -
+        # General is always first in youtube_jobs/youtube_by_product, and
+        # dict.setdefault keeps whichever attribution it sees first.
+        for entry in sorted(youtube_by_product, key=lambda e: e["product"] == "General"):
             for comment in entry["comments"]:
                 youtube_product_lookup.setdefault(comment, entry["product"])
 
+        # FIX: same "specific product before General" ordering as Google
+        # (above) and Twitter/Instagram (below) - without this, a comment
+        # returned by both the brand-wide "General" job and a real product's
+        # job (identical text) keeps whichever label came first in
+        # youtube_jobs/reddit_jobs, which is always "General" (job index 0).
+        # Sorting General-last means setdefault lets the real product claim
+        # it first, consistent with genuine product-specific attribution
+        # winning over the brand-wide bucket (see the matching Google fix
+        # above and ARCHITECTURE.md §3's "genuine and product-specific beats
+        # generic" principle).
         reddit_product_lookup: Dict[str, str] = {}
-        for entry in reddit_by_product:
+        for entry in sorted(reddit_by_product, key=lambda e: e["product"] == "General"):
             for comment in entry["comments"]:
                 reddit_product_lookup.setdefault(comment, entry["product"])
+
+        # Same "specific product before General" ordering as Google above -
+        # both platforms now run one job per product plus a "General" job,
+        # instead of the old single company-wide call whose output always
+        # fell through to the "General" default below.
+        twitter_product_lookup: Dict[str, str] = {}
+        for entry in sorted(twitter_by_product, key=lambda e: e["product"] == "General"):
+            for comment in entry["comments"]:
+                twitter_product_lookup.setdefault(comment, entry["product"])
+
+        instagram_product_lookup: Dict[str, str] = {}
+        for entry in sorted(instagram_by_product, key=lambda e: e["product"] == "General"):
+            for comment in entry["comments"]:
+                instagram_product_lookup.setdefault(comment, entry["product"])
 
         website_product_lookup: Dict[str, str] = {}
         for product_name, text in website_review_texts:
@@ -692,6 +1052,8 @@ async def analyze(request: Request, company_name: str = Form(...)):
             "Google": comment_product_lookup,
             "YouTube": youtube_product_lookup,
             "Reddit": reddit_product_lookup,
+            "Twitter": twitter_product_lookup,
+            "Instagram": instagram_product_lookup,
             "Website": website_product_lookup,
         }
 
@@ -701,12 +1063,26 @@ async def analyze(request: Request, company_name: str = Form(...)):
             for comment in comments:
                 product_label = lookup.get(comment, "General")
                 cleaned = normalize_text(remove_links(clean_comment(comment)))
-                if cleaned:
+                cleaned = cleaned.strip()  # FIX: strip before checking
+                if cleaned and len(cleaned) >= 3:  # FIX: guard against whitespace-only / near-empty leftovers (e.g. link-only or emoji-only comments)
                     combined.append((platform, cleaned, product_label))
 
         unique = unique_comments([(p, c) for p, c, _ in combined])
 
-        product_lookup_by_key = {(p, c.lower()): prod for p, c, prod in combined}
+        # FIX: rebuilt with the same "prefer a real product over General"
+        # priority used by the per-platform lookups above, instead of a
+        # plain dict comprehension (which let whichever row happens to be
+        # last in `combined` win a same-key collision with no regard for
+        # General vs product-specific). Only changes the outcome when two
+        # differently-labeled rows clean down to the exact same
+        # (platform, text) after clean_comment/normalize_text/remove_links -
+        # rare, but cheap to guard against consistently.
+        product_lookup_by_key = {}
+        for _p, _c, _prod in combined:
+            _key = (_p, _c.lower())
+            _existing = product_lookup_by_key.get(_key)
+            if _existing is None or (_existing == "General" and _prod != "General"):
+                product_lookup_by_key[_key] = _prod
 
         _stage_start = time.perf_counter()
         _sentiment_loop = asyncio.get_running_loop()
@@ -747,24 +1123,48 @@ async def analyze(request: Request, company_name: str = Form(...)):
         brand_score, brand_label = overall_stats["score"], overall_stats["score_label"]
 
         product_sentiment = _aggregate_by_key(product_rows, "product")
-        platform_sentiment = _aggregate_by_key(product_rows, "platform")
-        brand_reputation = _aggregate_brand_reputation(brand_rows)
+        platform_sentiment = _aggregate_by_key(comment_rows, "platform")
+        brand_reputation = _aggregate_brand_reputation(brand_rows, comment_rows)
+        # FIX: logged as its own stage instead of being silently folded into
+        # "Aspect Intelligence" below. This block (DataFrame build, product/
+        # brand split, four aggregation calls) is cheap pandas/dict work,
+        # not aspect analysis - bundling it in was quietly inflating the
+        # "Aspect Intelligence" number in every prior log. That number is
+        # specifically relied on elsewhere as a proxy for upstream comment
+        # volume (it should scale directly with comment count and nothing
+        # else), so it needs to actually measure only the call below.
+        _log_stage("Result Aggregation", time.perf_counter() - _stage_start)
+        _stage_start = time.perf_counter()
 
         try:
             aspect_intelligence = build_aspect_intelligence_by_product(product_rows, pipe=pipe)
         except Exception:
             logger.exception("Aspect intelligence build failed for %s", company_name)
             aspect_intelligence = {}
+        # Split out as its own labeled stage - this was previously running
+        # inside what got logged as "Report Generation" time, hiding the
+        # fact that it does its OWN full sentiment_batch pass over every
+        # detected aspect-mention snippet (see aspect_intelligence.py) -
+        # a second, undercounted pass through the same model call the
+        # main "Sentiment Analysis" stage above uses. Splitting this out
+        # means future logs actually show where time goes instead of
+        # blaming report-building code that was never the real cost.
+        _log_stage("Aspect Intelligence", time.perf_counter() - _stage_start)
+        _stage_start = time.perf_counter()
 
         try:
-            platforms_covered_count = len([p for p, c in platform_comments.items() if c])
+            # Scope platform coverage to platforms that actually contributed rows to
+            # product_rows -- NOT any platform with comments anywhere. Twitter/Instagram
+            # always land in brand_rows, so crediting them here would inflate confidence
+            # for a recommendation their data never fed into.
+            overall_platforms_covered_count = len({r["platform"] for r in product_rows})
             overall_platform_agreement = _platform_agreement(platform_sentiment)
             overall_aspect_consistency = _aspect_consistency(
                 [a for aspects in aspect_intelligence.values() for a in aspects]
             )
             confidence_score = _compute_confidence_score(
                 review_count=total,
-                platforms_covered=platforms_covered_count,
+                platforms_covered=overall_platforms_covered_count,
                 platform_agreement=overall_platform_agreement,
                 aspect_consistency=overall_aspect_consistency,
             )
@@ -773,9 +1173,14 @@ async def analyze(request: Request, company_name: str = Form(...)):
             for product_name in scrape_targets:
                 p_stats = product_sentiment.get(product_name, {})
                 p_aspects = aspect_intelligence.get(product_name, [])
+                # Per-product platform coverage: only platforms that actually
+                # contributed a row for THIS product, not the run-wide count.
+                p_platforms_covered_count = len({
+                    r["platform"] for r in product_rows if r.get("product") == product_name
+                })
                 p_confidence = _compute_confidence_score(
                     review_count=p_stats.get("total", 0),
-                    platforms_covered=platforms_covered_count,
+                    platforms_covered=p_platforms_covered_count,
                     platform_agreement=overall_platform_agreement,
                     aspect_consistency=_aspect_consistency(p_aspects),
                 )
@@ -838,7 +1243,7 @@ async def analyze(request: Request, company_name: str = Form(...)):
             product_recommendations=product_recommendations,
         )
 
-        insight_tabs = _build_insight_tabs(product_rows, platform_comments)
+        insight_tabs = _build_insight_tabs(comment_rows, platform_comments)  # FIX: use all comment_rows so brand-level (Twitter/Instagram/Google) rows are included
 
         product_title = ", ".join(scrape_targets) if scrape_targets else company_name
 
@@ -848,15 +1253,21 @@ async def analyze(request: Request, company_name: str = Form(...)):
 
         report_generated = datetime.utcnow().strftime("%B %d, %Y at %H:%M UTC")
 
+        _analyzed_counts_by_platform: Dict[str, int] = {}
+        for _row in comment_rows:
+            _p = _row.get("platform") or "Unknown"
+            _analyzed_counts_by_platform[_p] = _analyzed_counts_by_platform.get(_p, 0) + 1
+
         platform_counts = {
-            "Google":    len(platform_comments["Google"]),
-            "Twitter":   len(platform_comments["Twitter"]),
-            "Instagram": len(platform_comments["Instagram"]),
-            "YouTube":   len(platform_comments["YouTube"]),
-            "Reddit":    len(platform_comments["Reddit"]),
-            "Website":   len(platform_comments["Website"]),
+            "Google":    _analyzed_counts_by_platform.get("Google", 0),
+            "Twitter":   _analyzed_counts_by_platform.get("Twitter", 0),
+            "Instagram": _analyzed_counts_by_platform.get("Instagram", 0),
+            "YouTube":   _analyzed_counts_by_platform.get("YouTube", 0),
+            "Reddit":    _analyzed_counts_by_platform.get("Reddit", 0),
+            "Website":   _analyzed_counts_by_platform.get("Website", 0),
         }
 
+        _pdf_stage_start = time.perf_counter()
         pdf_path_str = ""
         try:
             pdf_path = generate_pdf_report(
@@ -881,6 +1292,28 @@ async def analyze(request: Request, company_name: str = Form(...)):
         except Exception:
             logger.exception("PDF report generation failed for %s", company_name)
 
+        comments_pdf_path_str = ""
+        try:
+            comments_pdf_path = generate_comments_pdf(
+                comment_rows=comment_rows,
+                company_name=company_name,
+                pdf_path=export_base / "all_comments.pdf",
+                product_title=product_title,
+            )
+            comments_pdf_path_str = comments_pdf_path.as_posix()
+        except Exception:
+            logger.exception("Comments PDF generation failed for %s", company_name)
+        # Previously completely unlogged: this whole block (both PDF
+        # generations, potentially writing thousands of untruncated
+        # comments into generate_comments_pdf) sat between the
+        # "Report Generation" log above and the _stage_start reset that
+        # used to happen right here - meaning its time vanished from every
+        # per-stage breakdown while still fully counting toward
+        # TOTAL EXECUTION TIME. Logged explicitly now so it's visible
+        # instead of silently inflating "Dashboard Rendering" or just
+        # disappearing from the numbers.
+        _log_stage("PDF Generation", time.perf_counter() - _pdf_stage_start)
+
         _stage_start = time.perf_counter()
         response = templates.TemplateResponse(
             request=request,
@@ -893,7 +1326,7 @@ async def analyze(request: Request, company_name: str = Form(...)):
                 "products_found":   product_data.get("products_found", 0),
                 "services_found":   product_data.get("services_found", 0),
                 "products_scraped": len(scrape_targets),
-                "reviews_collected": len(platform_comments["Google"]),
+                "reviews_collected": platform_counts["Google"],
                 "top_positive_product": top_positive_product,
                 "top_negative_product": top_negative_product,
                 "most_discussed_product": most_discussed_product,
@@ -923,6 +1356,7 @@ async def analyze(request: Request, company_name: str = Form(...)):
                 },
                 "summary":        summary,
                 "pdf_path":       pdf_path_str,
+                "comments_pdf_path": comments_pdf_path_str,
                 "download_dir":   str(export_base).replace("\\", "/"),
                 "report_generated": report_generated,
             },
@@ -993,6 +1427,7 @@ async def analyze(request: Request, company_name: str = Form(...)):
                 "chart_payload": {"labels": ["Positive", "Negative", "Neutral"], "values": [0, 0, 0]},
                 "summary":     _empty_summary,
                 "pdf_path": "",
+                "comments_pdf_path": "",
                 "download_dir": "downloads",
                 "report_generated": datetime.utcnow().strftime("%B %d, %Y at %H:%M UTC"),
             },
@@ -1085,6 +1520,7 @@ async def discover_products_endpoint(request: Request, company_name: str = Form(
                 "products": products,
                 "website": normalized_website,
                 "company": company_data,
+                "max_selectable": config.MAX_SELECTABLE_PRODUCTS,
             },
         )
 
@@ -1112,6 +1548,16 @@ async def analyze_selected(
     company_name = website
 
     selected_product_objects: List[SelectedProduct] = _parse_selected_products(selected_products)
+
+    if len(selected_product_objects) > config.MAX_SELECTABLE_PRODUCTS:
+        logger.warning(
+            "analyze_selected: %d products submitted, exceeding "
+            "MAX_SELECTABLE_PRODUCTS=%d; truncating to keep the analysis "
+            "inside its time budget (the frontend caps selection at this "
+            "number too, so this only bites requests that bypass the UI).",
+            len(selected_product_objects), config.MAX_SELECTABLE_PRODUCTS,
+        )
+        selected_product_objects = selected_product_objects[: config.MAX_SELECTABLE_PRODUCTS]
 
     scrape_targets: List[str] = [p.name for p in selected_product_objects]
 
@@ -1160,10 +1606,14 @@ async def analyze_selected(
             len(scrape_targets), company_name, scrape_targets,
         )
 
+        # See the matching comment in /analyze above: "General" keeps the
+        # real Maps scrape; every other job goes through
+        # scrape_google_product_reviews via a distinct product_name field,
+        # never appended onto company_name.
         google_jobs: List[Dict[str, Any]] = [{"label": "General", "data": company_data}]
         for product_obj in selected_product_objects:
             product_company_data = dict(company_data)
-            product_company_data["company_name"] = f"{company_data['company_name']} {product_obj.name}"
+            product_company_data["product_name"] = product_obj.name
             product_company_data["product"] = product_obj.as_dict()
             google_jobs.append({"label": product_obj.name, "data": product_company_data})
 
@@ -1181,8 +1631,47 @@ async def analyze_selected(
             reddit_product_data["product_brand"] = product_obj.brand
             reddit_jobs.append({"label": product_obj.name, "data": reddit_product_data})
 
+        # See the matching comment in /analyze above: "General" keeps the
+        # old brand-wide behaviour; every other job is genuinely product-
+        # specific instead of the old single "whole company" scrape that
+        # got labeled "General" for every selected product.
+        twitter_jobs: List[Dict[str, Any]] = [{"label": "General", "data": company_data}]
+        for product_obj in selected_product_objects:
+            twitter_product_data = dict(company_data)
+            twitter_product_data["product_name"] = product_obj.name
+            twitter_jobs.append({"label": product_obj.name, "data": twitter_product_data})
+
+        instagram_jobs: List[Dict[str, Any]] = [{"label": "General", "data": company_data}]
+        for product_obj in selected_product_objects:
+            instagram_product_data = dict(company_data)
+            instagram_product_data["product_name"] = product_obj.name
+            instagram_jobs.append({"label": product_obj.name, "data": instagram_product_data})
+
         website_review_jobs: List[Dict[str, Any]] = []
         for product_obj in selected_product_objects:
+            # FIX (confirmed live 2026-07-30 on Samsung India): this loop used to
+            # build a job unconditionally, even when product_obj.url was empty
+            # (e.g. "Galaxy S26 Ultra 256 GB｜12 GB Black" had no url in the
+            # selection payload). An empty product_url isn't caught anywhere
+            # downstream — _scrape_sync's `target = product_url or website`
+            # silently falls back to the company's `website` field, which is
+            # supposed to mean "root domain" but in this case was itself a
+            # specific product's landing page (Galaxy Z Fold8's), so Z Fold8's
+            # reviews got returned and labeled as if they were Galaxy S26
+            # Ultra's — the exact "not genuinely product-specific" problem this
+            # whole module exists to avoid, just via a different mechanism than
+            # a "General" job. /analyze (the other pipeline) already guards
+            # against this; this brings /analyze_selected to parity.
+            if not product_obj.url:
+                logger.warning(
+                    "Website review job SKIPPED for %r: no product URL in the "
+                    "selection payload, so there is nothing genuinely "
+                    "product-specific to scrape here (falling back to the "
+                    "company website would attribute a different page's "
+                    "reviews to this product).",
+                    product_obj.name,
+                )
+                continue
             website_review_data = dict(company_data)
             website_review_data["product_url"] = product_obj.url
             website_review_data["product_name"] = product_obj.name
@@ -1192,38 +1681,110 @@ async def analyze_selected(
         youtube_semaphore = asyncio.Semaphore(MAX_BROWSER_WORKERS)
         reddit_semaphore = asyncio.Semaphore(MAX_REDDIT_WORKERS)
         website_review_semaphore = asyncio.Semaphore(MAX_WEBSITE_REVIEW_WORKERS)
+        twitter_semaphore = asyncio.Semaphore(MAX_TWITTER_WORKERS)
+        instagram_semaphore = asyncio.Semaphore(MAX_INSTAGRAM_WORKERS)
 
-        GOOGLE_JOB_TIMEOUT_SECONDS = 48
-        TWITTER_TIMEOUT_SECONDS = 32
-        INSTAGRAM_TIMEOUT_SECONDS = 34
-        YOUTUBE_TIMEOUT_SECONDS = 30
-        REDDIT_TIMEOUT_SECONDS = 20
-        WEBSITE_REVIEW_TIMEOUT_SECONDS = 60
+        # VALUE HISTORY: originally 48s. Raised to 90s on the reasoning
+        # that Google Reviews is scraped at most ONCE per business per run
+        # (see scrape_google_reviews()'s single-flight cache in
+        # google_scraper.py), not once per selected product, so a bigger
+        # timeout was a one-time cost per analysis, not a multiplied one -
+        # and the old 48s ceiling was itself why review volume was low
+        # even for genuinely popular products (browser setup + Maps
+        # navigation + Reviews-tab detection routinely ate most of that
+        # budget, leaving only ~10-20s for the scroll loop that actually
+        # collects reviews). This also raised the ceiling on the
+        # "Collecting Reviews" stage as a whole, since
+        # results = await asyncio.gather(...) below waits for the slowest
+        # platform branch. Subsequently CUT to the current 45s once the
+        # whole-pipeline 1-3 minute ceiling took priority over Google's
+        # one-time cost being individually affordable - a 90s stage is
+        # still a large fraction of a 180s total budget even though it
+        # only happens once per run. Must stay in sync with
+        # OUTER_HARD_TIMEOUT_SECONDS in google_scraper.py (that value
+        # anchors this scraper's own internal deadline to the same
+        # job-start clock this wait_for counts against) - if one changes,
+        # so must the other, or the scrape can be cancelled here
+        # mid-flight with nothing to show for it.
+        GOOGLE_JOB_TIMEOUT_SECONDS = 45  # cut from 90 (itself raised from 48) - kept in sync with google_scraper.py OUTER_HARD_TIMEOUT_SECONDS
+        TWITTER_TIMEOUT_SECONDS = 45  # must be kept in sync with twitter_scraper.py OUTER_HARD_TIMEOUT_SECONDS
+        # PREVIOUS GAP: unlike YOUTUBE_TIMEOUT_SECONDS/REDDIT_TIMEOUT_SECONDS
+        # just below, Twitter had no General/per-product split at all - the
+        # brand-wide "General" job silently got the same 45s as a genuine
+        # per-product job, contradicting cross-cutting principle #1
+        # (ARCHITECTURE.md §3: General is lower-priority than per-product).
+        # With MAX_BROWSER_WORKERS=3 threads shared across up to 4 jobs
+        # (General + up to 3 selected products), a General job using its
+        # full budget competed for a real OS thread exactly as long as a
+        # job that actually matters. Must be kept equal to
+        # twitter_scraper.py's own GENERAL_OUTER_HARD_TIMEOUT_SECONDS - per
+        # that file's comment, shortening app.py's wait_for alone doesn't
+        # help (asyncio.wait_for can't stop the underlying Playwright
+        # thread - see §8), so the scraper's own internal deadline had to
+        # shrink too for this to do anything real.
+        GENERAL_TWITTER_TIMEOUT_SECONDS = 25  # the brand-wide "General" job only, not per-product jobs - see _scrape_twitter_job's comment
+        INSTAGRAM_TIMEOUT_SECONDS = 30  # cut from 45 - kept in sync with instagram_scraper.py OUTER_HARD_TIMEOUT_SECONDS
+        # Raised 30s -> 620s. Production logs showed 30s was only ever enough
+        # time for ONE candidate video per product before the outer deadline
+        # hit - nowhere near enough for hundreds/thousands of comments across
+        # many videos. Must stay in sync with OUTER_HARD_TIMEOUT_SECONDS in
+        # youtube_scraper.py (620 = that scraper's 600s internal deadline +
+        # a slice of margin for the result to propagate back through
+        # run_in_executor()/wait_for()).
+        YOUTUBE_TIMEOUT_SECONDS = 100  # cut from 620 - kept in sync with youtube_scraper.py OUTER_HARD_TIMEOUT_SECONDS (90) plus buffer
+        GENERAL_YOUTUBE_TIMEOUT_SECONDS = 25  # the brand-wide "General" job only, not per-product jobs - see _scrape_youtube_job's comment
+        # Raised 20 -> 90 to match reddit_scraper.py's TIME_BUDGET_SECONDS=80
+        # (was a 2s margin, sized for the old 60-comment/single-tier behavior -
+        # production logs showed real completions at 22.8s, already past both
+        # the old internal and outer caps, silently discarding real results).
+        REDDIT_TIMEOUT_SECONDS = 50  # cut from 90 - kept in sync with reddit_scraper.py TIME_BUDGET_SECONDS (40) plus buffer
+        GENERAL_REDDIT_TIMEOUT_SECONDS = 20  # the brand-wide "General" job only, not per-product jobs - see _scrape_reddit_job's comment
+        # website_review_scraper.py's numbers have moved a few times (MAX_REVIEWS
+        # and WIDGET_PAGINATE_TIME_BUDGET_SECONDS both went up for a "1000+
+        # genuine reviews" pass, then both came back down - 30 reviews,
+        # WIDGET_PAGINATE_TIME_BUDGET_SECONDS=30 - once priority shifted to the
+        # 3-min total pipeline ceiling; see that file's own comments for the
+        # current numbers, since duplicating them here is exactly how the two
+        # went out of sync before). Current worst case inside that file:
+        # TIME_BUDGET_SECONDS (30, sync HTTP) + PLAYWRIGHT_TIME_BUDGET_SECONDS
+        # (20, 503 fallback fetch) + WIDGET_PAGINATE_TIME_BUDGET_SECONDS +
+        # WIDGET_PAGINATE_SETUP_ALLOWANCE_SECONDS (30+35=65, widget-click
+        # pagination, now that its setup time is no longer silently counted
+        # against the click-budget) = 115s. This is 130, a 15s buffer on top.
+        WEBSITE_REVIEW_TIMEOUT_SECONDS = 130  # widened from 90 (stale 30+20+30=80s estimate) - see comment above
 
         async def _scrape_google_job(job: Dict[str, Any]) -> List[str]:
+            # "General" = real Google Maps business-wide reviews (cached,
+            # single-flight across the whole run). Every other label is a
+            # genuinely product-specific search-snippet scrape instead -
+            # see scrape_google_product_reviews()'s docstring for why Maps
+            # itself is skipped for those.
+            is_general = job.get("label") == "General"
             async with google_semaphore:
                 try:
-                    return await asyncio.wait_for(
-                        scrape_google_reviews(job["data"]),
-                        timeout=GOOGLE_JOB_TIMEOUT_SECONDS,
-                    )
+                    if is_general:
+                        coro = scrape_google_reviews(job["data"])
+                    else:
+                        coro = scrape_google_product_reviews(job["data"])
+                    return await asyncio.wait_for(coro, timeout=GOOGLE_JOB_TIMEOUT_SECONDS)
                 except asyncio.TimeoutError:
                     logger.warning(
-                        "Google Reviews job for %r exceeded its %.0fs hard "
+                        "Google %s job for %r exceeded its %.0fs hard "
                         "timeout — no partial results are recoverable here "
                         "(asyncio.wait_for cancels the awaited coroutine on "
                         "timeout and this returns []); any in-progress "
-                        "background scrape may still finish and populate "
-                        "the cache for a later request, see "
-                        "scrape_google_reviews()'s own logging for that.",
+                        "background scrape may still finish (and, for the "
+                        "General/Maps job, populate the cache for a later "
+                        "request).",
+                        "Maps" if is_general else "Product Search",
                         job.get("label"), GOOGLE_JOB_TIMEOUT_SECONDS,
                     )
                     return []
                 except asyncio.CancelledError:
-                    logger.warning("Google Reviews job for %r was cancelled", job.get("label"))
+                    logger.warning("Google job for %r was cancelled", job.get("label"))
                     return []
                 except Exception:
-                    logger.exception("Google Reviews job for %r failed", job.get("label"))
+                    logger.exception("Google job for %r failed", job.get("label"))
                     return []
 
         async def _scrape_google_jobs_group() -> List[Any]:
@@ -1237,11 +1798,23 @@ async def analyze_selected(
                 _log_stage("Google Review Collection", time.perf_counter() - _group_start)
 
         async def _scrape_youtube_job(job: Dict[str, Any]) -> List[str]:
+            # The "General" job is brand-wide, not product-specific - lower
+            # priority than the per-product jobs per the person's own stated
+            # preference (genuine product-based comments first). Live log:
+            # it was routinely using its full budget to pull a full 100
+            # comments via a generic "channel_name_search" fallback, adding
+            # real volume/sentiment-analysis time for the platform's least
+            # important bucket. A much shorter budget still gets a real
+            # (if smaller) sample when one's available, without costing the
+            # product-specific jobs anything - it has its own semaphore
+            # slot regardless of how long it runs.
+            is_general = job.get("label") == "General"
+            job_timeout = GENERAL_YOUTUBE_TIMEOUT_SECONDS if is_general else YOUTUBE_TIMEOUT_SECONDS
             async with youtube_semaphore:
                 try:
                     return await asyncio.wait_for(
                         scrape_youtube_comments(job["data"]),
-                        timeout=YOUTUBE_TIMEOUT_SECONDS,
+                        timeout=job_timeout,
                     )
                 except asyncio.TimeoutError:
                     logger.warning(
@@ -1252,7 +1825,7 @@ async def analyze_selected(
                         "synchronous Playwright work keeps running to "
                         "completion in the background, unseen, holding a "
                         "browser-worker slot until it finishes on its own).",
-                        job.get("label"), YOUTUBE_TIMEOUT_SECONDS,
+                        job.get("label"), job_timeout,
                     )
                     return []
                 except asyncio.CancelledError:
@@ -1273,7 +1846,18 @@ async def analyze_selected(
                 _log_stage("YouTube Scraper", time.perf_counter() - _group_start)
             seen_keys: set = set()
             by_product: List[Dict[str, Any]] = []
-            for job, outcome in zip(youtube_jobs, per_job_results):
+            # FIX: sort General (brand-wide) behind product-specific jobs
+            # before dedup — same pattern as _scrape_reddit_jobs_group() just
+            # below. Without it, a comment surfaced by both a product-specific
+            # search and the brand-wide "General" search is claimed by
+            # whichever is processed first; youtube_jobs lists General first,
+            # so it used to win and a genuine product-specific comment was
+            # dropped as a "duplicate" instead of kept under its real product.
+            # See ARCHITECTURE.md §4.8 / §0 item 9.
+            for job, outcome in sorted(
+                zip(youtube_jobs, per_job_results),
+                key=lambda pair: pair[0]["label"] == "General",
+            ):
                 comments = list(outcome) if not isinstance(outcome, BaseException) else []
                 deduped: List[str] = []
                 for c in comments:
@@ -1286,18 +1870,24 @@ async def analyze_selected(
             return by_product
 
         async def _scrape_reddit_job(job: Dict[str, Any]) -> List[str]:
+            # Same reasoning as _scrape_youtube_job just above: "General" is
+            # brand-wide, lower priority than product-specific per the
+            # person's own stated preference, and Reddit is httpx-based/
+            # cheap so a much shorter budget still gets a real sample.
+            is_general = job.get("label") == "General"
+            job_timeout = GENERAL_REDDIT_TIMEOUT_SECONDS if is_general else REDDIT_TIMEOUT_SECONDS
             async with reddit_semaphore:
                 try:
                     return await asyncio.wait_for(
                         scrape_reddit_comments(job["data"]),
-                        timeout=REDDIT_TIMEOUT_SECONDS,
+                        timeout=job_timeout,
                     )
                 except asyncio.TimeoutError:
                     logger.warning(
                         "Reddit Scraper job for %r exceeded its %.0fs hard "
                         "timeout — returning [] (no partial results are "
                         "recoverable here).",
-                        job.get("label"), REDDIT_TIMEOUT_SECONDS,
+                        job.get("label"), job_timeout,
                     )
                     return []
                 except asyncio.CancelledError:
@@ -1318,7 +1908,125 @@ async def analyze_selected(
                 _log_stage("Reddit Scraper", time.perf_counter() - _group_start)
             seen_keys: set = set()
             by_product: List[Dict[str, Any]] = []
-            for job, outcome in zip(reddit_jobs, per_job_results):
+            # FIX: process specific-product jobs before "General" here too -
+            # same pattern as comment_product_lookup's sort a few hundred
+            # lines below for Google/Twitter/Instagram. reddit_jobs always
+            # has "General" first (see its construction above), and this
+            # loop used to iterate in that raw order - so whenever General's
+            # single company-name-only search happened to surface the same
+            # comment a specific product's search also found (realistic,
+            # not just theoretical: the company_product tier is literally
+            # "<company> <product>", a superset of General's own query),
+            # General claimed it first and the product-specific occurrence
+            # was removed outright as a "duplicate", not merely relabeled -
+            # permanently dropping a genuine product-specific comment from
+            # that product's results. Sorting General to the end lets a real
+            # product claim a shared comment first, exactly like the
+            # Google/Twitter/Instagram fix already does.
+            for job, outcome in sorted(
+                zip(reddit_jobs, per_job_results),
+                key=lambda pair: pair[0]["label"] == "General",
+            ):
+                comments = list(outcome) if not isinstance(outcome, BaseException) else []
+                deduped: List[str] = []
+                for c in comments:
+                    key = c.strip().lower()
+                    if not key or key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    deduped.append(c)
+                by_product.append({"product": job["label"], "comments": deduped})
+            return by_product
+
+        async def _scrape_twitter_job(job: Dict[str, Any]) -> List[str]:
+            # Same reasoning as _scrape_reddit_job/_scrape_youtube_job above:
+            # "General" is brand-wide and lower priority than a genuine
+            # per-product job. Unlike Reddit, Twitter is still browser-based
+            # for this fallback, so the saving comes from twitter_scraper.py
+            # itself cutting its OWN internal deadline short for General
+            # (see GENERAL_OUTER_HARD_TIMEOUT_SECONDS there) - this outer
+            # timeout only needs to stay >= that value so app.py doesn't cut
+            # the coroutine off before the scraper's own graceful return.
+            is_general = job.get("label") == "General"
+            job_timeout = GENERAL_TWITTER_TIMEOUT_SECONDS if is_general else TWITTER_TIMEOUT_SECONDS
+            async with twitter_semaphore:
+                try:
+                    return await asyncio.wait_for(
+                        scrape_twitter_comments(job["data"]),
+                        timeout=job_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Twitter Scraper job for %r exceeded its %.0fs hard "
+                        "timeout — returning [] (no partial results are "
+                        "recoverable here).",
+                        job.get("label"), job_timeout,
+                    )
+                    return []
+                except asyncio.CancelledError:
+                    logger.warning("Twitter Scraper job for %r was cancelled", job.get("label"))
+                    return []
+                except Exception:
+                    logger.exception("Twitter Scraper job for %r failed", job.get("label"))
+                    return []
+
+        async def _scrape_twitter_jobs_group() -> List[Dict[str, Any]]:
+            _group_start = time.perf_counter()
+            try:
+                per_job_results = await asyncio.gather(
+                    *(_scrape_twitter_job(job) for job in twitter_jobs),
+                    return_exceptions=True,
+                )
+            finally:
+                _log_stage("Twitter Scraper", time.perf_counter() - _group_start)
+            seen_keys: set = set()
+            by_product: List[Dict[str, Any]] = []
+            for job, outcome in zip(twitter_jobs, per_job_results):
+                comments = list(outcome) if not isinstance(outcome, BaseException) else []
+                deduped: List[str] = []
+                for c in comments:
+                    key = c.strip().lower()
+                    if not key or key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    deduped.append(c)
+                by_product.append({"product": job["label"], "comments": deduped})
+            return by_product
+
+        async def _scrape_instagram_job(job: Dict[str, Any]) -> List[str]:
+            async with instagram_semaphore:
+                try:
+                    return await asyncio.wait_for(
+                        scrape_instagram_comments(job["data"]),
+                        timeout=INSTAGRAM_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Instagram Scraper job for %r exceeded its %.0fs hard "
+                        "timeout — returning [] (no partial results are "
+                        "recoverable here).",
+                        job.get("label"), INSTAGRAM_TIMEOUT_SECONDS,
+                    )
+                    return []
+                except asyncio.CancelledError:
+                    logger.warning("Instagram Scraper job for %r was cancelled", job.get("label"))
+                    return []
+                except Exception:
+                    logger.exception("Instagram Scraper job for %r failed", job.get("label"))
+                    return []
+
+        async def _scrape_instagram_jobs_group() -> List[Dict[str, Any]]:
+            _group_start = time.perf_counter()
+            try:
+                per_job_results = await asyncio.gather(
+                    *(_scrape_instagram_job(job) for job in instagram_jobs),
+                    return_exceptions=True,
+                )
+            finally:
+                _log_stage("Instagram Scraper", time.perf_counter() - _group_start)
+            seen_keys: set = set()
+            by_product: List[Dict[str, Any]] = []
+            for job, outcome in zip(instagram_jobs, per_job_results):
                 comments = list(outcome) if not isinstance(outcome, BaseException) else []
                 deduped: List[str] = []
                 for c in comments:
@@ -1364,8 +2072,8 @@ async def analyze_selected(
 
         results = await asyncio.gather(
             _scrape_google_jobs_group(),
-            _timed("Twitter Scraper", scrape_twitter_comments(company_data), timeout=TWITTER_TIMEOUT_SECONDS),
-            _timed("Instagram Scraper", scrape_instagram_comments(company_data), timeout=INSTAGRAM_TIMEOUT_SECONDS),
+            _scrape_twitter_jobs_group(),
+            _scrape_instagram_jobs_group(),
             _scrape_youtube_jobs_group(),
             _scrape_reddit_jobs_group(),
             _timed(
@@ -1377,7 +2085,8 @@ async def analyze_selected(
         )
 
         google_results = results[0]
-        twitter_comments, instagram_comments = results[1], results[2]
+        twitter_by_product: List[Dict[str, Any]] = results[1] if not isinstance(results[1], BaseException) else []
+        instagram_by_product: List[Dict[str, Any]] = results[2] if not isinstance(results[2], BaseException) else []
         youtube_by_product: List[Dict[str, Any]] = results[3] if not isinstance(results[3], BaseException) else []
         reddit_by_product: List[Dict[str, Any]] = results[4] if not isinstance(results[4], BaseException) else []
         product_intelligence_results = results[5] if not isinstance(results[5], BaseException) else []
@@ -1387,11 +2096,16 @@ async def analyze_selected(
         ]
         website_review_job_results = results[6] if not isinstance(results[6], BaseException) else []
 
+        # FIX: same config.MAX_COMMENTS_PER_PRODUCT slice removed here as
+        # for Website Review (see that comment for the full reasoning) - it
+        # ran after the scrape already finished, saved no time, and only
+        # discarded results. google_scraper.py's own MAX_GOOGLE_REVIEWS cap
+        # (config.py) plus GOOGLE_JOB_TIMEOUT_SECONDS above already govern
+        # volume here, same as every other platform.
         google_by_product: List[Dict[str, Any]] = []
         google_all_comments: List[str] = []
         for job, outcome in zip(google_jobs, google_results):
             comments = list(outcome) if not isinstance(outcome, BaseException) else []
-            comments = comments[:config.MAX_COMMENTS_PER_PRODUCT]
             google_by_product.append({"product": job["label"], "comments": comments})
             google_all_comments.extend(comments)
 
@@ -1412,9 +2126,12 @@ async def analyze_selected(
             for review in (pi.get("website_reviews") or []):
                 _add_website_review(product_obj.name, review.get("text") or "")
 
+        # FIX: same config.MAX_COMMENTS_PER_PRODUCT slice removed here as
+        # in /analyze (see that comment for the full reasoning) - it ran
+        # after the scrape already finished and only discarded results
+        # the widget-pagination work had already paid the time cost for.
         for job, outcome in zip(website_review_jobs, website_review_job_results):
             comments = list(outcome) if not isinstance(outcome, BaseException) else []
-            comments = comments[:config.MAX_COMMENTS_PER_PRODUCT]
             for text in comments:
                 _add_website_review(job["label"], text)
 
@@ -1426,29 +2143,74 @@ async def analyze_selected(
         for entry in reddit_by_product:
             reddit_all_comments.extend(entry["comments"])
 
+        twitter_all_comments: List[str] = []
+        for entry in twitter_by_product:
+            twitter_all_comments.extend(entry["comments"])
+
+        instagram_all_comments: List[str] = []
+        for entry in instagram_by_product:
+            instagram_all_comments.extend(entry["comments"])
+
         platform_comments = {
             "Google":    google_all_comments,
-            "Twitter":   list(twitter_comments)   if not isinstance(twitter_comments,   BaseException) else [],
-            "Instagram": list(instagram_comments) if not isinstance(instagram_comments, BaseException) else [],
+            "Twitter":   twitter_all_comments,
+            "Instagram": instagram_all_comments,
             "YouTube":   youtube_all_comments,
             "Reddit":    reddit_all_comments,
             "Website":   [text for _, text in website_review_texts],
         }
 
         comment_product_lookup: Dict[str, str] = {}
-        for entry in google_by_product:
+        # FIX: process specific-product Google jobs before the "General" business-level job,
+        # so setdefault lets a real product claim a shared/duplicate review before "General" does.
+        for entry in sorted(google_by_product, key=lambda e: e["product"] == "General"):
             for comment in entry["comments"]:
                 comment_product_lookup.setdefault(comment, entry["product"])
 
         youtube_product_lookup: Dict[str, str] = {}
-        for entry in youtube_by_product:
+        # FIX: same ordering bug as Google above, just found here too -
+        # process specific-product YouTube jobs before the "General"
+        # brand-wide job, so setdefault lets a real product claim a
+        # shared/duplicate comment before "General" does. Without this, a
+        # comment a per-product job genuinely found on a product-specific
+        # video could still get silently attributed to "General" instead
+        # (and therefore dropped from that product's own dashboard card -
+        # see _split_product_and_brand_rows) whenever the exact same
+        # comment text also happened to surface via the General job -
+        # General is always first in youtube_jobs/youtube_by_product, and
+        # dict.setdefault keeps whichever attribution it sees first.
+        for entry in sorted(youtube_by_product, key=lambda e: e["product"] == "General"):
             for comment in entry["comments"]:
                 youtube_product_lookup.setdefault(comment, entry["product"])
 
+        # FIX: same "specific product before General" ordering as Google
+        # (above) and Twitter/Instagram (below) - without this, a comment
+        # returned by both the brand-wide "General" job and a real product's
+        # job (identical text) keeps whichever label came first in
+        # youtube_jobs/reddit_jobs, which is always "General" (job index 0).
+        # Sorting General-last means setdefault lets the real product claim
+        # it first, consistent with genuine product-specific attribution
+        # winning over the brand-wide bucket (see the matching Google fix
+        # above and ARCHITECTURE.md §3's "genuine and product-specific beats
+        # generic" principle).
         reddit_product_lookup: Dict[str, str] = {}
-        for entry in reddit_by_product:
+        for entry in sorted(reddit_by_product, key=lambda e: e["product"] == "General"):
             for comment in entry["comments"]:
                 reddit_product_lookup.setdefault(comment, entry["product"])
+
+        # Same "specific product before General" ordering as Google above -
+        # both platforms now run one job per product plus a "General" job,
+        # instead of the old single company-wide call whose output always
+        # fell through to the "General" default below.
+        twitter_product_lookup: Dict[str, str] = {}
+        for entry in sorted(twitter_by_product, key=lambda e: e["product"] == "General"):
+            for comment in entry["comments"]:
+                twitter_product_lookup.setdefault(comment, entry["product"])
+
+        instagram_product_lookup: Dict[str, str] = {}
+        for entry in sorted(instagram_by_product, key=lambda e: e["product"] == "General"):
+            for comment in entry["comments"]:
+                instagram_product_lookup.setdefault(comment, entry["product"])
 
         website_product_lookup: Dict[str, str] = {}
         for product_name, text in website_review_texts:
@@ -1458,6 +2220,8 @@ async def analyze_selected(
             "Google": comment_product_lookup,
             "YouTube": youtube_product_lookup,
             "Reddit": reddit_product_lookup,
+            "Twitter": twitter_product_lookup,
+            "Instagram": instagram_product_lookup,
             "Website": website_product_lookup,
         }
 
@@ -1467,10 +2231,24 @@ async def analyze_selected(
             for comment in comments:
                 product_label = lookup.get(comment, "General")
                 cleaned = normalize_text(remove_links(clean_comment(comment)))
-                if cleaned:
+                cleaned = cleaned.strip()  # FIX: strip before checking
+                if cleaned and len(cleaned) >= 3:  # FIX: guard against whitespace-only / near-empty leftovers (e.g. link-only or emoji-only comments)
                     combined.append((platform, cleaned, product_label))
         unique = unique_comments([(p, c) for p, c, _ in combined])
-        product_lookup_by_key = {(p, c.lower()): prod for p, c, prod in combined}
+        # FIX: rebuilt with the same "prefer a real product over General"
+        # priority used by the per-platform lookups above, instead of a
+        # plain dict comprehension (which let whichever row happens to be
+        # last in `combined` win a same-key collision with no regard for
+        # General vs product-specific). Only changes the outcome when two
+        # differently-labeled rows clean down to the exact same
+        # (platform, text) after clean_comment/normalize_text/remove_links -
+        # rare, but cheap to guard against consistently.
+        product_lookup_by_key = {}
+        for _p, _c, _prod in combined:
+            _key = (_p, _c.lower())
+            _existing = product_lookup_by_key.get(_key)
+            if _existing is None or (_existing == "General" and _prod != "General"):
+                product_lookup_by_key[_key] = _prod
 
         _stage_start = time.perf_counter()
         _sentiment_loop = asyncio.get_running_loop()
@@ -1511,24 +2289,48 @@ async def analyze_selected(
         brand_score, brand_label = overall_stats["score"], overall_stats["score_label"]
 
         product_sentiment = _aggregate_by_key(product_rows, "product")
-        platform_sentiment = _aggregate_by_key(product_rows, "platform")
-        brand_reputation = _aggregate_brand_reputation(brand_rows)
+        platform_sentiment = _aggregate_by_key(comment_rows, "platform")
+        brand_reputation = _aggregate_brand_reputation(brand_rows, comment_rows)
+        # FIX: logged as its own stage instead of being silently folded into
+        # "Aspect Intelligence" below. This block (DataFrame build, product/
+        # brand split, four aggregation calls) is cheap pandas/dict work,
+        # not aspect analysis - bundling it in was quietly inflating the
+        # "Aspect Intelligence" number in every prior log. That number is
+        # specifically relied on elsewhere as a proxy for upstream comment
+        # volume (it should scale directly with comment count and nothing
+        # else), so it needs to actually measure only the call below.
+        _log_stage("Result Aggregation", time.perf_counter() - _stage_start)
+        _stage_start = time.perf_counter()
 
         try:
             aspect_intelligence = build_aspect_intelligence_by_product(product_rows, pipe=pipe)
         except Exception:
             logger.exception("Aspect intelligence build failed for %s", company_name)
             aspect_intelligence = {}
+        # Split out as its own labeled stage - this was previously running
+        # inside what got logged as "Report Generation" time, hiding the
+        # fact that it does its OWN full sentiment_batch pass over every
+        # detected aspect-mention snippet (see aspect_intelligence.py) -
+        # a second, undercounted pass through the same model call the
+        # main "Sentiment Analysis" stage above uses. Splitting this out
+        # means future logs actually show where time goes instead of
+        # blaming report-building code that was never the real cost.
+        _log_stage("Aspect Intelligence", time.perf_counter() - _stage_start)
+        _stage_start = time.perf_counter()
 
         try:
-            platforms_covered_count = len([p for p, c in platform_comments.items() if c])
+            # Scope platform coverage to platforms that actually contributed rows to
+            # product_rows -- NOT any platform with comments anywhere. Twitter/Instagram
+            # always land in brand_rows, so crediting them here would inflate confidence
+            # for a recommendation their data never fed into.
+            overall_platforms_covered_count = len({r["platform"] for r in product_rows})
             overall_platform_agreement = _platform_agreement(platform_sentiment)
             overall_aspect_consistency = _aspect_consistency(
                 [a for aspects in aspect_intelligence.values() for a in aspects]
             )
             confidence_score = _compute_confidence_score(
                 review_count=total,
-                platforms_covered=platforms_covered_count,
+                platforms_covered=overall_platforms_covered_count,
                 platform_agreement=overall_platform_agreement,
                 aspect_consistency=overall_aspect_consistency,
             )
@@ -1537,9 +2339,14 @@ async def analyze_selected(
             for product_name in scrape_targets:
                 p_stats = product_sentiment.get(product_name, {})
                 p_aspects = aspect_intelligence.get(product_name, [])
+                # Per-product platform coverage: only platforms that actually
+                # contributed a row for THIS product, not the run-wide count.
+                p_platforms_covered_count = len({
+                    r["platform"] for r in product_rows if r.get("product") == product_name
+                })
                 p_confidence = _compute_confidence_score(
                     review_count=p_stats.get("total", 0),
-                    platforms_covered=platforms_covered_count,
+                    platforms_covered=p_platforms_covered_count,
                     platform_agreement=overall_platform_agreement,
                     aspect_consistency=_aspect_consistency(p_aspects),
                 )
@@ -1601,7 +2408,7 @@ async def analyze_selected(
             product_recommendations=product_recommendations,
         )
 
-        insight_tabs = _build_insight_tabs(product_rows, platform_comments)
+        insight_tabs = _build_insight_tabs(comment_rows, platform_comments)  # FIX: use all comment_rows so brand-level (Twitter/Instagram/Google) rows are included
 
         product_title = ", ".join(scrape_targets) if scrape_targets else company_name
 
@@ -1611,15 +2418,21 @@ async def analyze_selected(
 
         report_generated = datetime.utcnow().strftime("%B %d, %Y at %H:%M UTC")
 
+        _analyzed_counts_by_platform: Dict[str, int] = {}
+        for _row in comment_rows:
+            _p = _row.get("platform") or "Unknown"
+            _analyzed_counts_by_platform[_p] = _analyzed_counts_by_platform.get(_p, 0) + 1
+
         platform_counts = {
-            "Google":    len(platform_comments["Google"]),
-            "Twitter":   len(platform_comments["Twitter"]),
-            "Instagram": len(platform_comments["Instagram"]),
-            "YouTube":   len(platform_comments["YouTube"]),
-            "Reddit":    len(platform_comments["Reddit"]),
-            "Website":   len(platform_comments["Website"]),
+            "Google":    _analyzed_counts_by_platform.get("Google", 0),
+            "Twitter":   _analyzed_counts_by_platform.get("Twitter", 0),
+            "Instagram": _analyzed_counts_by_platform.get("Instagram", 0),
+            "YouTube":   _analyzed_counts_by_platform.get("YouTube", 0),
+            "Reddit":    _analyzed_counts_by_platform.get("Reddit", 0),
+            "Website":   _analyzed_counts_by_platform.get("Website", 0),
         }
 
+        _pdf_stage_start = time.perf_counter()
         pdf_path_str = ""
         try:
             pdf_path = generate_pdf_report(
@@ -1644,6 +2457,28 @@ async def analyze_selected(
         except Exception:
             logger.exception("PDF report generation failed for %s", company_name)
 
+        comments_pdf_path_str = ""
+        try:
+            comments_pdf_path = generate_comments_pdf(
+                comment_rows=comment_rows,
+                company_name=company_name,
+                pdf_path=export_base / "all_comments.pdf",
+                product_title=product_title,
+            )
+            comments_pdf_path_str = comments_pdf_path.as_posix()
+        except Exception:
+            logger.exception("Comments PDF generation failed for %s", company_name)
+        # Previously completely unlogged: this whole block (both PDF
+        # generations, potentially writing thousands of untruncated
+        # comments into generate_comments_pdf) sat between the
+        # "Report Generation" log above and the _stage_start reset that
+        # used to happen right here - meaning its time vanished from every
+        # per-stage breakdown while still fully counting toward
+        # TOTAL EXECUTION TIME. Logged explicitly now so it's visible
+        # instead of silently inflating "Dashboard Rendering" or just
+        # disappearing from the numbers.
+        _log_stage("PDF Generation", time.perf_counter() - _pdf_stage_start)
+
         _stage_start = time.perf_counter()
         response = templates.TemplateResponse(
             request=request,
@@ -1656,7 +2491,7 @@ async def analyze_selected(
                 "products_found":   len(scrape_targets),
                 "services_found":   0,
                 "products_scraped": len(scrape_targets),
-                "reviews_collected": len(platform_comments["Google"]),
+                "reviews_collected": platform_counts["Google"],
                 "top_positive_product": top_positive_product,
                 "top_negative_product": top_negative_product,
                 "most_discussed_product": most_discussed_product,
@@ -1687,6 +2522,7 @@ async def analyze_selected(
                 "buying_recommendation": overall_buying_recommendation,
                 "product_recommendations": product_recommendations,
                 "pdf_path":       pdf_path_str,
+                "comments_pdf_path": comments_pdf_path_str,
                 "download_dir":   str(export_base).replace("\\", "/"),
                 "report_generated": report_generated,
             },
@@ -1759,6 +2595,7 @@ async def analyze_selected(
                 },
                 "product_recommendations": {},
                 "pdf_path": "",
+                "comments_pdf_path": "",
                 "download_dir": "downloads",
                 "report_generated": datetime.utcnow().strftime("%B %d, %Y at %H:%M UTC"),
             },
@@ -1854,9 +2691,19 @@ def _compute_overall_stats(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "score": score, "score_label": label,
     }
 
-def _aggregate_brand_reputation(brand_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _aggregate_brand_reputation(
+    brand_rows: List[Dict[str, Any]],
+    all_rows: "List[Dict[str, Any]] | None" = None,
+) -> Dict[str, Any]:
     overall = _compute_overall_stats(brand_rows)
-    by_platform = _aggregate_by_key(brand_rows, "platform")
+    # The headline brand-reputation score stays scoped to brand_rows (comments not
+    # tied to a specific selected product), but the per-platform breakdown should
+    # reflect every platform that returned ANY comments this run — otherwise a
+    # platform like Google/YouTube/Website (always product-attributed) never shows
+    # up here, and a platform like Twitter/Instagram (always brand-level) never
+    # shows up in the product-scoped platform_sentiment table. Falling back to
+    # all_rows (product_rows + brand_rows combined) fixes that gap.
+    by_platform = _aggregate_by_key(all_rows if all_rows is not None else brand_rows, "platform")
     google_maps_rows = [r for r in brand_rows if r.get("platform") == "Google"]
     google_maps = _compute_overall_stats(google_maps_rows)
     return {
@@ -1888,7 +2735,8 @@ def _top_snippets(comment_rows: List[Dict[str, Any]], sentiment: str, limit: int
 def _build_insight_tabs(
     comment_rows: List[Dict[str, Any]],
     platform_comments: Dict[str, List[str]],
-    per_tab_limit: int = 10,
+    per_tab_limit: int = 5,
+    top_list_limit: int = 5,
 ) -> Dict[str, Any]:
     def _representative(rows: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
         ranked = sorted(rows, key=lambda r: abs(len(r["comment"].split()) - 15))
@@ -1918,8 +2766,8 @@ def _build_insight_tabs(
             by_platform[platform] = _diverse_sample(rows, per_tab_limit)
 
     return {
-        "top_positive": _representative(positive_rows, per_tab_limit),
-        "top_negative": _representative(negative_rows, per_tab_limit),
+        "top_positive": _representative(positive_rows, top_list_limit),
+        "top_negative": _representative(negative_rows, top_list_limit),
         "by_platform":  by_platform,
     }
 
@@ -2579,6 +3427,81 @@ def generate_pdf_report(
         leftMargin=2 * cm, rightMargin=2 * cm,
         topMargin=2 * cm, bottomMargin=2.2 * cm,
         title=f"{product_title} — ManobhavaAI Product Intelligence Report",
+    )
+    doc.build(story, onFirstPage=_pdf_footer, onLaterPages=_pdf_footer)
+    return pdf_path
+
+
+_PDF_SENTIMENT_COLOR = {
+    "positive": _PDF_POSITIVE,
+    "negative": _PDF_NEGATIVE,
+    "neutral":  _PDF_NEUTRAL,
+}
+
+
+def generate_comments_pdf(
+    comment_rows: List[Dict[str, Any]],
+    company_name: str,
+    pdf_path: Path,
+    product_title: str = "",
+) -> Path:
+    """
+    Dump every raw scraped comment, grouped by platform, into a plain
+    reference PDF. Purely for manual QA (checking scraped comments are
+    real/valid) — not a polished report, just full text + sentiment +
+    product + timestamp for every row that fed the dashboard.
+    """
+    styles = _pdf_styles()
+    story: List[Any] = []
+
+    title = product_title or company_name or "Unknown Company"
+    story.append(Paragraph(f"{title} — All Scraped Comments", styles["h1"]))
+    story.append(Paragraph(
+        f"Generated {datetime.utcnow().strftime('%B %d, %Y at %H:%M UTC')} "
+        f"&nbsp;·&nbsp; {len(comment_rows)} total comment(s)",
+        styles["table_cell_left"],
+    ))
+    story.append(HRFlowable(width="100%", thickness=1.4, color=_PDF_PRIMARY,
+                            spaceBefore=8, spaceAfter=12))
+
+    by_platform: Dict[str, List[Dict[str, Any]]] = {}
+    for row in comment_rows:
+        platform = (row.get("platform") or "Unknown").strip() or "Unknown"
+        by_platform.setdefault(platform, []).append(row)
+
+    if not by_platform:
+        story.append(Paragraph("No comments were collected for this run.", styles["body"]))
+
+    for i, platform in enumerate(sorted(by_platform.keys())):
+        rows = by_platform[platform]
+        if i > 0:
+            story.append(PageBreak())
+        story.extend(_pdf_section_heading(f"{platform} ({len(rows)})", styles))
+
+        for row in rows:
+            sentiment = (row.get("sentiment") or "neutral").lower()
+            sent_color = _PDF_SENTIMENT_COLOR.get(sentiment, _PDF_NEUTRAL)
+            sent_hex = sent_color.hexval() if hasattr(sent_color, "hexval") else "#8A6A1F"
+            product = row.get("product") or "General"
+            timestamp = row.get("timestamp") or ""
+            comment_text = (row.get("comment") or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+            meta_bits = [
+                f'<font color="{sent_hex}"><b>{sentiment.upper()}</b></font>',
+                f"Product: {product}",
+            ]
+            if timestamp:
+                meta_bits.append(str(timestamp))
+            story.append(Paragraph(" &nbsp;|&nbsp; ".join(meta_bits), styles["table_cell_left"]))
+            story.append(Paragraph(comment_text or "<i>(empty)</i>", styles["body"]))
+            story.append(Spacer(1, 10))
+
+    doc = SimpleDocTemplate(
+        str(pdf_path),
+        pagesize=A4,
+        leftMargin=2 * cm, rightMargin=2 * cm,
+        topMargin=2 * cm, bottomMargin=2.2 * cm,
+        title=f"{title} — All Scraped Comments",
     )
     doc.build(story, onFirstPage=_pdf_footer, onLaterPages=_pdf_footer)
     return pdf_path

@@ -1,3 +1,43 @@
+"""
+Module Name
+-----------
+scrapers/google_scraper.py
+
+Purpose
+-------
+Collects genuine, product-specific customer feedback from Google: reviews
+left on a company's Google Business Profile (via Google Maps), matched
+and disambiguated against the actual company being analyzed, plus (where
+a product page exposes its own on-page Google-sourced reviews)
+per-product review text.
+
+Responsibilities
+-----------------
+- `scrape_google_reviews(company_data)`: locate the correct Google Maps
+  business listing for a company (disambiguating common/generic names by
+  appending the company's own website domain — see
+  `_disambiguate_maps_query`, fixed after a real mismatch in production),
+  open its Reviews panel, and collect review text, translating
+  non-English reviews where Maps offers a translation.
+- `scrape_google_product_reviews(product_data)`: collect reviews specific
+  to a single product page, when available, kept separate from the
+  business-level review cache described below.
+- Attaches to the single shared Chromium process via
+  `scrapers.browser_utils.ensure_shared_browser()` rather than launching
+  its own — see that module's header for why this matters on this
+  project's resource-constrained target hardware.
+- Emits `BROWSER_TRACE`-prefixed timing logs at each setup/navigation
+  checkpoint (playwright start, shared-browser attach, context/page
+  creation, the Maps search navigation itself) so a slow or failed run
+  can be diagnosed from a plain log without a debugger attached.
+
+Dependencies
+------------
+`playwright` (sync API, run on a dedicated worker thread/pool via
+browser_utils), plus standard library `asyncio`, `re`, `threading`,
+`time`.
+"""
+
 import asyncio
 import atexit
 import concurrent.futures
@@ -12,13 +52,12 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 from urllib.parse import quote_plus
 
-from scrapers.browser_utils import browser_launch_slot, normalize_comments
+from scrapers.browser_utils import browser_manager, normalize_comments
 from config import (
     MAX_GOOGLE_REVIEWS,
     MAX_SCROLL_ITERATIONS,
     SCROLL_IDLE_LIMIT,
     NAVIGATION_RETRIES,
-    NAV_TIMEOUT_MS,
     NAV_TIMEOUT_MS_MAX,
     NAV_TIMEOUT_MS_MIN,
     GOOGLE_REVIEW_CACHE_TTL_SECONDS,
@@ -56,11 +95,70 @@ MAX_RESULTS = MAX_GOOGLE_REVIEWS
 # but page-load timing is network-dependent and should be validated
 # against real traffic; treat this as a strong first pass, not a
 # guaranteed-final number.
+#
+# NOTE: this value is kept only as the "how long a clean run needs once
+# setup is already finished" reference the paragraph above describes - it
+# is NOT what _scrape_sync/_scrape_sync_product actually use for their
+# deadline. See OUTER_HARD_TIMEOUT_SECONDS immediately below for why, and
+# for the real fix.
 TIME_BUDGET_SECONDS = 35
 
+# --- Real (outer-timeout-anchored) deadline -----------------------------
+# MECHANISM (still current): a fresh TIME_BUDGET_SECONDS clock started
+# after setup can legally push the total past app.py's outer
+# asyncio.wait_for() cap once setup cost is added in - and that cap is a
+# hard cliff, not a soft budget. Production logs once showed a caller
+# giving up at the outer cap while the background scrape kept running
+# unseen and finished moments later with real reviews that never reached
+# the dashboard, because the coroutine that would have returned them had
+# already been cancelled. Fixed the same way as twitter_scraper.py/
+# instagram_scraper.py/youtube_scraper.py: one real wall-clock deadline
+# anchored to `start` (== `queued_at`, the moment scrape_google_reviews()/
+# scrape_google_product_reviews() itself started, which is also
+# effectively when app.py's wait_for() began counting against this job),
+# via OUTER_HARD_TIMEOUT_SECONDS / SAFETY_MARGIN_SECONDS, so _scrape_sync
+# always leaves real margin for the result to make it back through
+# run_in_executor()/asyncio.shield()/wait_for(), no matter how long setup
+# took. This is also why pairing this with the browser pre-warm matters:
+# with setup down to ~1-3s (warmed) instead of 17s+ (cold), the working
+# budget this computes (OUTER_HARD_TIMEOUT_SECONDS - SAFETY_MARGIN_SECONDS
+# - setup) comes out larger on a warm run than a cold/contended one - the
+# anchoring only costs real working time on a still-cold/contended run,
+# which is exactly the situation where the alternative was overrunning the
+# outer cap anyway.
+#
+# VALUE HISTORY (kept for context - the number actually in effect is the
+# line comment on OUTER_HARD_TIMEOUT_SECONDS itself, not this paragraph):
+# originally 48s, matching app.py's old GOOGLE_JOB_TIMEOUT_SECONDS. Raised
+# to 90s on the reasoning that Google Reviews is single-flight cached per
+# business (see the cache near the bottom of this file), so a bigger
+# timeout was a one-time cost per analysis run, not a multiplied one - and
+# the old 48s ceiling was itself why setup+nav+Reviews-tab detection was
+# routinely leaving only ~10-20s for the scroll loop that actually
+# collects review text, capping volume even for a genuinely popular
+# product. Subsequently cut to the current 45s once the whole-pipeline
+# 1-3 minute ceiling took priority over Google's one-time cost being
+# individually affordable - a ~90s stage is still a large share of a 180s
+# total budget even though it only happens once per run. If a future
+# session revisits this number, weigh both considerations explicitly
+# rather than re-deriving just one side of the trade-off.
+OUTER_HARD_TIMEOUT_SECONDS = 45  # cut from 90 (itself raised from 48) - priority shifted to the whole-pipeline 3-min ceiling. must be kept in sync with app.py's GOOGLE_JOB_TIMEOUT_SECONDS
+SAFETY_MARGIN_SECONDS = 8.0
+
+# Below this much remaining budget, don't even attempt the initial Maps
+# navigation - _INITIAL_NAV_RESERVE_SECONDS (defined further down, = 11)
+# is what the navigation+candidate-scan step alone needs, and there has to
+# be a few seconds left over on top of that for the Reviews-tab hunt and
+# feed wait that follow it to have any realistic chance, or this just
+# burns time on a navigation that can never reach the part that actually
+# collects reviews.
+MIN_USEFUL_BUDGET_SECONDS = 15.0
+
 # --- Navigation retry policy --------------------------------------------
+# No backoff sleep between retry attempts: the observed failure mode is a
+# slow-but-eventually-successful navigation, not a transient fast-fail that
+# benefits from waiting before retrying (see _goto_with_retry).
 NAV_RETRIES = NAVIGATION_RETRIES
-NAV_RETRY_BACKOFF_SECONDS = 0.75
 
 # --- Browser pool ---------------------------------------------------------
 # Instead of launching a brand-new Chromium process for every single
@@ -75,6 +173,29 @@ NAV_RETRY_BACKOFF_SECONDS = 0.75
 # many calls instead of being torn down every time.
 MAX_BROWSER_WORKERS = 3
 
+# FOUND THIS SESSION (from code review; not yet confirmed against a live
+# log - worth checking the next fresh log for this specifically): app.py's
+# google_semaphore (config.MAX_PARALLEL_TASKS = 5 slots) lets every Google
+# job start at once from app.py's side - the one "General" job plus one
+# per selected product, so up to 4 with MAX_SELECTABLE_PRODUCTS=3. All 4
+# then submit to THIS module's own _EXECUTOR, which only has
+# MAX_BROWSER_WORKERS=3 threads. With 4 jobs and 3 workers, one job always
+# sits queued inside the ThreadPoolExecutor waiting for a thread to free
+# up - and since queued_at (captured before submission - see
+# scrape_google_reviews()/scrape_google_product_reviews()) is what
+# OUTER_HARD_TIMEOUT_SECONDS anchors its deadline to, that queueing delay
+# comes directly out of the queued job's own working budget before a
+# single line of its Playwright code runs. Raising this to 4 would remove
+# the queueing but adds a 4th concurrent Chromium context specifically for
+# Google, on top of Twitter/Instagram/YouTube/Website Review's own worker
+# pools sharing the same 2-core/4-thread CPU (see ARCHITECTURE.md's
+# CPU-contention section) - not a clear win without live-log evidence that
+# queueing, rather than Google's own anti-bot posture, is the actual
+# bottleneck for whichever job runs last. To check: compare "elapsed since
+# job start" against "setup took" in _scrape_sync's "browser/context/page
+# setup took..." log line - a gap much bigger than setup_elapsed itself is
+# queueing delay, not setup cost.
+#
 # Recycle a worker's browser context after this many scrapes even if it's
 # healthy, so long-running server processes don't slowly accumulate memory
 # / detached listeners inside a single long-lived Chromium tab-set.
@@ -303,6 +424,21 @@ _REVIEWS_TAB_SELECTORS = [
 # realistically ever left over.
 _PLACE_RESULT_LOOP_MIN_TIME_SECONDS = 8
 
+# Reserved for the settle wait + layout-detection step that must run right
+# after the initial Maps navigation, before the candidate scan even starts.
+_SETTLE_RESERVE_SECONDS = 3.0
+
+# Reserved, ahead of time, for everything downstream of the initial Maps
+# navigation - the settle/layout-detection step AND the candidate-scan step
+# itself (_PLACE_RESULT_LOOP_MIN_TIME_SECONDS). Without this, an adaptive
+# nav timeout computed purely from "whatever budget is left" can (with
+# retries) legally consume down to just a few seconds remaining - below
+# what the candidate scan needs to even attempt - which is exactly the
+# "Maps detected -> scan skipped -> BUSINESS_NOT_FOUND" failure seen in
+# production logs. This constant is only applied to the *initial* Maps
+# navigation call, since that is the one sitting in front of the scan.
+_INITIAL_NAV_RESERVE_SECONDS = _PLACE_RESULT_LOOP_MIN_TIME_SECONDS + _SETTLE_RESERVE_SECONDS
+
 # Selectors for a place result in the Maps search results list, used to
 # click into a place's detail page. Listed in order of specificity: the
 # structural href match is resilient to Google's periodic class-name
@@ -370,6 +506,7 @@ _SEARCH_RESULTS_INDICATOR_SELECTORS = [
 # re-read a wall of "continuing anyway" warnings. Every call site below
 # that can plausibly explain a 0-review outcome logs exactly one of these.
 DIAG_BUSINESS_NOT_FOUND = "BUSINESS_NOT_FOUND"
+DIAG_BUSINESS_MISMATCH = "BUSINESS_MISMATCH"
 DIAG_REVIEWS_TAB_MISSING = "REVIEWS_TAB_MISSING"
 DIAG_FEED_MISSING = "FEED_MISSING"
 DIAG_ZERO_REVIEWS = "ZERO_REVIEWS"
@@ -405,6 +542,7 @@ _UI_LABEL_BLACKLIST = {
 # thread at a time because each thread only ever runs jobs handed to it by
 # the ThreadPoolExecutor below.
 _thread_local = threading.local()
+_browser_trace = threading.local()
 
 _EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=MAX_BROWSER_WORKERS, thread_name_prefix="google_scraper"
@@ -590,27 +728,39 @@ def _dismiss_consent(page) -> None:
             continue
 
 
-def _adaptive_nav_timeout(time_left) -> int:
+def _adaptive_nav_timeout(time_left, reserve_seconds: float = 0.0) -> int:
     """Scale the navigation timeout to how much of the internal time
     budget is actually left, instead of a fixed 5000ms for every attempt.
 
+    ``reserve_seconds`` carves out time for phases that must run *after*
+    this navigation completes (settle/layout-detection, candidate scan) so
+    navigation is budget-aware in both directions: it still won't ask for
+    more than is actually left, but it also can no longer legally consume
+    the entire remaining budget down to nothing, starving whatever runs
+    next. Callers that have no downstream phase to protect (e.g. the
+    click-through and fallback navigations, which run after the scan) pass
+    the default of 0.0 and get the original behavior.
+
     Navigation always receives at least NAV_TIMEOUT_MS_MIN (8s) as long as
-    that much time is actually left in the budget - the budget clock only
-    starts once browser/context/page setup has finished (see _scrape_sync
-    below), so this floor is real, not eaten by Chromium startup. When
-    plenty of budget remains the timeout can scale up to NAV_TIMEOUT_MS_MAX
-    (12s) for a genuinely slow page (Maps in particular can be slow to
-    paint its results list); when the budget itself is under the floor, we
-    hand over whatever is left rather than blocking past the scraper's own
-    deadline.
+    that much *navigable* time (remaining minus the reserve) is available -
+    the budget clock only starts once browser/context/page setup has
+    finished (see _scrape_sync below), so this floor is real, not eaten by
+    Chromium startup. When plenty of budget remains the timeout can scale
+    up to NAV_TIMEOUT_MS_MAX (12s) for a genuinely slow page (Maps in
+    particular can be slow to paint its results list); when the navigable
+    time itself is under the floor, we hand over whatever is left rather
+    than blocking past the scraper's own deadline.
     """
-    remaining_ms = max(0.0, time_left()) * 1000
-    if remaining_ms <= NAV_TIMEOUT_MS_MIN:
-        return max(3000, int(remaining_ms))
-    return int(min(NAV_TIMEOUT_MS_MAX, max(NAV_TIMEOUT_MS_MIN, remaining_ms * 0.5)))
+    navigable_ms = max(0.0, time_left() - reserve_seconds) * 1000
+    if navigable_ms <= NAV_TIMEOUT_MS_MIN:
+        return max(3000, int(navigable_ms))
+    return int(min(NAV_TIMEOUT_MS_MAX, max(NAV_TIMEOUT_MS_MIN, navigable_ms * 0.5)))
 
 
-def _goto_with_retry(page, url: str, *, timeout: int, time_left, retries: int = NAV_RETRIES) -> bool:
+def _goto_with_retry(
+    page, url: str, *, timeout: int, time_left, retries: int = NAV_RETRIES,
+    reserve_seconds: float = 0.0,
+) -> bool:
     # ``timeout`` is accepted for call-site compatibility but is intentionally
     # ignored: we recompute an adaptive timeout before every attempt so that
     # retries never ask for more time than the scraper actually has left.
@@ -629,7 +779,7 @@ def _goto_with_retry(page, url: str, *, timeout: int, time_left, retries: int = 
         # not the value frozen at call time.  This is the core fix: a failed
         # attempt burns real wall-clock time, so each retry must recalculate
         # rather than reuse a stale number that can now exceed what is left.
-        attempt_timeout = _adaptive_nav_timeout(time_left)
+        attempt_timeout = _adaptive_nav_timeout(time_left, reserve_seconds)
         if attempt > 0:
             logger.info(
                 "Google nav retry attempt=%d/%d url=%s remaining=%.1fs chosen_timeout=%dms",
@@ -644,20 +794,12 @@ def _goto_with_retry(page, url: str, *, timeout: int, time_left, retries: int = 
                 "Navigation attempt %d/%d to %s failed: %s",
                 attempt + 1, total_attempts, url, exc,
             )
-            if attempt < retries:
-                # Cap the backoff sleep to what is actually left minus the
-                # minimum guard (3 s) so we never sleep past the deadline.
-                backoff = min(
-                    NAV_RETRY_BACKOFF_SECONDS * (attempt + 1),
-                    max(0.0, time_left() - 3),
-                )
-                if backoff <= 0:
-                    logger.warning(
-                        "No time left for backoff before retry %d/%d to %s; aborting.",
-                        attempt + 2, total_attempts, url,
-                    )
-                    break
-                time.sleep(backoff)
+            # No backoff sleep between attempts: the observed failure mode
+            # is a slow-but-eventually-successful navigation, not a
+            # transient fast-fail that benefits from waiting before retry -
+            # sleeping here only spends shared budget that the candidate
+            # scan needs later, for no measurable benefit.
+            continue
     logger.error("Giving up on %s after %d attempts: %s", url, total_attempts, last_exc)
     return False
 
@@ -908,7 +1050,17 @@ def _collect_texts(page, selectors: List[str], limit_per_selector: int = 25) -> 
 def _ensure_context():
     """Get (creating or recycling as needed) this thread's browser context."""
     handle = _get_handle()
+    browser_trace_started_at = time.monotonic()
+    _browser_trace.ensure_context_started_at = browser_trace_started_at
     ctx = handle.context
+    logger.info(
+        "CONTEXT_STATE_TRACE thread_id=%s has_playwright=%s has_browser=%s has_context=%s uses=%d",
+        threading.get_ident(),
+        handle.playwright is not None,
+        handle.browser is not None,
+        handle.context is not None,
+        handle.uses,
+    )
 
     if ctx is not None:
         if handle.uses >= MAX_USES_BEFORE_RECYCLE:
@@ -916,34 +1068,67 @@ def _ensure_context():
                 "Recycling browser context on %s after %d uses.",
                 threading.current_thread().name, handle.uses,
             )
-            _teardown_thread_browser()
+            _teardown_thread_browser(reason="recycle")
             ctx = None
         else:
             try:
                 _ = ctx.pages  # cheap liveness check
                 handle.uses += 1
+                logger.info("USING EXISTING CONTEXT")
                 return ctx
             except Exception:
                 logger.warning(
                     "Browser context on %s appears dead; recreating.",
                     threading.current_thread().name,
                 )
-                _teardown_thread_browser()
+                _teardown_thread_browser(reason="dead_context")
                 ctx = None
 
+    logger.info("CREATING NEW CONTEXT")
     from playwright.sync_api import sync_playwright
 
     pw = handle.playwright
     if pw is None:
+        logger.info(
+            "BROWSER_TRACE scraper=Google event=before_sync_playwright_start elapsed=%.3fs timestamp=%.3f thread=%s",
+            time.monotonic() - browser_trace_started_at, time.time(), threading.current_thread().name,
+        )
         pw = sync_playwright().start()
+        logger.info(
+            "BROWSER_TRACE scraper=Google event=after_sync_playwright_start elapsed=%.3fs timestamp=%.3f thread=%s",
+            time.monotonic() - browser_trace_started_at, time.time(), threading.current_thread().name,
+        )
         handle.playwright = pw
 
-    with browser_launch_slot():
-        browser = pw.chromium.launch(headless=True, args=_LAUNCH_ARGS)
+    logger.info(
+        "BROWSER_TRACE scraper=Google event=before_shared_browser_attach elapsed=%.3fs timestamp=%.3f thread=%s",
+        time.monotonic() - browser_trace_started_at, time.time(), threading.current_thread().name,
+    )
+    # Attach to the ONE application-wide Chromium process instead of
+    # launching a new one. ensure_shared_browser() only actually launches
+    # Chromium on the very first call anywhere in the process; every call
+    # after that - including this one, almost always - just returns the
+    # existing CDP endpoint immediately. This (not a per-call launch slot)
+    # is what removes the 44-46s startup stall: see browser_utils.py's
+    # BrowserManager.ensure_shared_browser() docstring for the mechanics.
+    cdp_endpoint = browser_manager.ensure_shared_browser()
+    browser = pw.chromium.connect_over_cdp(cdp_endpoint)
+    logger.info(
+        "BROWSER_TRACE scraper=Google event=after_shared_browser_attach elapsed=%.3fs timestamp=%.3f thread=%s",
+        time.monotonic() - browser_trace_started_at, time.time(), threading.current_thread().name,
+    )
+    logger.info(
+        "BROWSER_TRACE scraper=Google event=before_new_context elapsed=%.3fs timestamp=%.3f thread=%s",
+        time.monotonic() - browser_trace_started_at, time.time(), threading.current_thread().name,
+    )
     context = browser.new_context(
         user_agent=_USER_AGENT,
         locale="en-US",
         viewport={"width": 1280, "height": 900},
+    )
+    logger.info(
+        "BROWSER_TRACE scraper=Google event=after_new_context elapsed=%.3fs timestamp=%.3f thread=%s",
+        time.monotonic() - browser_trace_started_at, time.time(), threading.current_thread().name,
     )
     context.set_default_timeout(8000)
     context.set_default_navigation_timeout(10000)
@@ -957,7 +1142,74 @@ def _ensure_context():
     return context
 
 
-def _teardown_thread_browser() -> None:
+# --- Startup pre-warm --------------------------------------------------
+# ROOT CAUSE (the other half of "Google never collects anything", together
+# with the deadline-anchoring fix above): production logs show this
+# thread's own sync_playwright().start() + attaching to the shared
+# Chromium process + new_context() regularly taking 17s+ on a cold/
+# contended run (Twitter/Instagram/up to 3 YouTube jobs all doing the same
+# at the same instant) - and unlike Twitter/Instagram/YouTube, Google had
+# no pre-warm at all, so it paid that full cost inside the real request's
+# time budget every single time.
+#
+# That setup cost is a ONE-TIME, per-worker-thread cost - _ensure_context
+# above already reuses a live context on later calls via a cheap
+# `ctx.pages` check instead of redoing setup. So instead of a real,
+# time-boxed scrape request paying that cost for the first time, pay it
+# once here in the background at module import time (mirrors both the
+# "Sentiment pipeline preloaded at startup" pattern and the identical
+# pre-warm added to twitter_scraper.py/instagram_scraper.py/
+# youtube_scraper.py) - well before the first real request in practice.
+#
+# MAX_BROWSER_WORKERS separate jobs are submitted (not just one) so every
+# thread this module's own _EXECUTOR could later hand a real scrape to
+# gets warmed, not just whichever one happens to run first.
+#
+# IMPORTANT - the mistake that silently defeated this same fix on the
+# other three scrapers: app.py sets WindowsSelectorEventLoopPolicy
+# process-wide at import time (see browser_utils.py), but only the
+# Proactor loop can launch subprocesses on Windows - Playwright's sync API
+# spawns its driver as a subprocess, so without re-asserting Proactor
+# FIRST, this raises NotImplementedError on every warm-up thread on
+# Windows (non-fatal, since it's wrapped in try/except below, but it means
+# the warm-up silently does nothing and setup stays slow). The real
+# request path (_scrape_sync) already re-asserts Proactor for the same
+# reason; this warm-up needs its own copy of that same guard since it runs
+# on a separate thread before any real request ever calls _scrape_sync.
+#
+# Best-effort only and never blocks import: each job runs on _EXECUTOR's
+# own worker threads, not the importing thread, and any failure (e.g. a
+# dev machine without Playwright's browsers installed yet) is caught and
+# logged - the first real request then simply falls back to paying the
+# setup cost itself, exactly as it did before this change.
+def _warm_up_browser_context() -> None:
+    if sys.platform.startswith("win"):
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    try:
+        _ensure_context()
+        logger.info(
+            "Google: browser context pre-warmed on %s.",
+            threading.current_thread().name,
+        )
+    except Exception:
+        logger.exception(
+            "Google: background browser context warm-up failed on %s "
+            "(non-fatal - the first real request will pay the setup "
+            "cost itself instead, same as before this change).",
+            threading.current_thread().name,
+        )
+
+
+for _ in range(MAX_BROWSER_WORKERS):
+    _EXECUTOR.submit(_warm_up_browser_context)
+
+
+def _teardown_thread_browser(reason: str = "unknown") -> None:
+    logger.info(
+        "TEARDOWN_TRACE thread_id=%s reason=%s",
+        threading.get_ident(),
+        reason,
+    )
     handle = _get_handle()
     try:
         if handle.context is not None:
@@ -1124,6 +1376,124 @@ def _any_selector_present(page, selectors: List[str], timeout: int = 2000) -> bo
     return False
 
 
+# Selectors for the business name heading on a place detail page, tried in
+# order. Reused from _BUSINESS_PAGE_INDICATOR_SELECTORS's own name-bearing
+# entries rather than duplicated separately.
+_BUSINESS_NAME_SELECTORS = ["h1.DUwDvf", "div.TIHn2 h1", "h1"]
+
+
+def _extract_business_page_name(page, timeout: int = 2500) -> str:
+    """Read the business name actually rendered on the current place page.
+
+    Used only to verify a Maps redirect/click landed on the right
+    business - see _business_name_matches_target() below.
+    """
+    for sel in _BUSINESS_NAME_SELECTORS:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0:
+                text = loc.inner_text(timeout=timeout).strip()
+                if text:
+                    return text
+        except Exception:
+            continue
+    return ""
+
+
+def _business_name_matches_target(candidate_name: str, target_name: str) -> bool:
+    """True if a landed/clicked business's displayed name plausibly is the
+    target company, not just some other business Maps or a fuzzy text
+    search happened to surface.
+
+    ROOT CAUSE this guards against: a single-result Maps redirect
+    (layout == "business_page" in _scrape_maps) was previously trusted
+    unconditionally - the name-similarity scoring that already existed for
+    the search-results-list click-through path never ran for a direct
+    redirect. In production this let a query for "boAt Lifestyle" silently
+    land on and scrape an unrelated local business called "LIFE STYLE
+    TOWN" (Maps' fuzzy match on "Lifestyle"/"Life Style") - a handful of
+    real reviews were returned, just for the wrong business entirely, and
+    nothing in the pipeline could tell the difference. Low review *volume*
+    from that business looked identical to low volume from a genuinely
+    quiet Maps listing for the real company.
+
+    Three independent signals, any one of which is enough to pass -
+    genuine name variations (extra "Pvt Ltd" suffixes, punctuation,
+    word-order differences) shouldn't be rejected just because they don't
+    match perfectly:
+      1. Direct substring containment either direction.
+      2. Character-level similarity (SequenceMatcher) above a modest bar.
+      3. Meaningful token overlap (handles reordering / extra boilerplate
+         words like "Store", "Official", "India").
+    """
+    if not candidate_name or not target_name:
+        return False
+    cand = candidate_name.lower().strip()
+    target = target_name.lower().strip()
+    if not cand or not target:
+        return False
+
+    if target in cand or cand in target:
+        return True
+
+    similarity = SequenceMatcher(None, target, cand).ratio()
+    if similarity >= 0.75:
+        return True
+
+    target_tokens = set(re.findall(r"[a-z0-9]+", target))
+    cand_tokens = set(re.findall(r"[a-z0-9]+", cand))
+    if target_tokens:
+        overlap_count = len(target_tokens & cand_tokens)
+        if len(target_tokens) == 1:
+            # Single-word target: that one token must actually be present.
+            # (Usually already caught by the substring check above - this
+            # is mostly a backstop for token-order edge cases.)
+            if overlap_count >= 1:
+                return True
+        else:
+            # Multi-word target: require near-full containment, not just
+            # >=50% of any tokens. A short brand name like "boAt Lifestyle"
+            # has only 2 tokens, and "boat" alone is a common dictionary
+            # word - a single shared token isn't enough evidence to trust
+            # this is really the same business (e.g. an unrelated "Boat
+            # Rental Company" would otherwise pass at a 50% bar). Require
+            # at least half AND at least 2 overlapping tokens.
+            overlap_ratio = overlap_count / len(target_tokens)
+            if overlap_ratio >= 0.5 and overlap_count >= 2:
+                return True
+
+    return False
+
+
+_SETTLE_POLL_SELECTOR = ", ".join(
+    _SEARCH_RESULTS_INDICATOR_SELECTORS + _BUSINESS_PAGE_INDICATOR_SELECTORS
+)
+
+
+def _wait_for_layout_ready(page, max_ms: int) -> bool:
+    """Poll in short steps for either a search-results or business-page
+    indicator instead of always sleeping a fixed settle window.
+
+    Mirrors ``_wait_for_more``'s pattern: cheap ``.count()`` checks (which,
+    unlike ``wait_for_selector``, don't themselves block) on a combined
+    selector, polled every 100ms until something matches or ``max_ms``
+    elapses. Returns True the moment either layout's indicators show up in
+    the DOM, so a fast-rendering page moves on immediately instead of
+    always paying the full window; a slow one still gets up to ``max_ms``
+    before the caller proceeds to the real (visibility-aware) layout
+    classification regardless.
+    """
+    deadline = time.monotonic() + (max_ms / 1000)
+    while time.monotonic() < deadline:
+        try:
+            if page.locator(_SETTLE_POLL_SELECTOR).count() > 0:
+                return True
+        except Exception:
+            return False
+        page.wait_for_timeout(100)
+    return False
+
+
 def _detect_maps_layout(page, time_left) -> str:
     """Classify the current Maps page before deciding how to reach the
     business, instead of always assuming a search-results list exists.
@@ -1151,7 +1521,7 @@ def _detect_maps_layout(page, time_left) -> str:
     # Multiple distinct "/maps/place/" links is an unambiguous sign that
     # we're still looking at a multi-result search list (a real business
     # detail page only ever links to itself, if at all). This is checked
-    # BEFORE the business-page indicators below because those indicators
+    # BEFORE the selector-based layout probes below because business indicators
     # (e.g. div[role='tablist'] for the filter-chip row, or a rating
     # jsaction hook on an individual result card) can also appear on the
     # search-results page itself and were causing a real results list to
@@ -1165,24 +1535,47 @@ def _detect_maps_layout(page, time_left) -> str:
     if place_link_count > 1:
         return "search_results"
 
-    if _any_selector_present(page, _BUSINESS_PAGE_INDICATOR_SELECTORS, timeout=budget_ms):
-        return "business_page"
     if _any_selector_present(page, _SEARCH_RESULTS_INDICATOR_SELECTORS, timeout=budget_ms):
         return "search_results"
+    if _any_selector_present(page, _BUSINESS_PAGE_INDICATOR_SELECTORS, timeout=budget_ms):
+        return "business_page"
     return "unknown"
 
 
+# Combined selector string for a single wait_for_selector() call, mirroring
+# the Step A fix in _scrape_maps (candidate scan) and _wait_for_layout_ready's
+# _SETTLE_POLL_SELECTOR above - the same "one combined wait beats N sequential
+# per-selector waits" pattern used twice already elsewhere in this file.
+_REVIEW_PANEL_COMBINED_SELECTOR = ", ".join(_REVIEW_PANEL_SELECTORS)
+
+
 def _wait_for_review_panel(page, time_left) -> bool:
-    """One sweep through the layered review-feed selector fallbacks."""
-    for sel in _REVIEW_PANEL_SELECTORS:
-        if time_left() <= 10:
-            break
-        try:
-            page.wait_for_selector(sel, timeout=6000)
-            return True
-        except Exception:
-            continue
-    return False
+    """One combined wait across every review-feed selector fallback.
+
+    FIX: this used to loop over _REVIEW_PANEL_SELECTORS one at a time, each
+    with its own fresh 6000ms page.wait_for_selector() call - the exact same
+    anti-pattern already found and fixed for _PLACE_RESULT_SELECTORS in
+    _scrape_maps' "Step A" (see that comment for the full writeup).
+    wait_for_selector() only returns early on a MATCH, not on a miss, so a
+    selector that was never going to appear on this page still burns its
+    full 6000ms before the loop tries the next one. With 11 entries in
+    _REVIEW_PANEL_SELECTORS, a business whose feed matched late in the list
+    (or not at all) could burn most of an 11 x 6s stretch just hunting for
+    the panel - and since _scrape_maps calls this up to three times in a row
+    (see Step 3), that cost could compound. Whatever it ate came directly
+    out of Step 4's scroll loop, which is the part that actually collects
+    review text - so this was budget stolen from genuine review collection,
+    not spent on it. One combined selector string lets Playwright match
+    whichever pattern is present in a single wait, exactly like the Step A
+    and _wait_for_layout_ready fixes already applied elsewhere in this file.
+    """
+    if time_left() <= 10:
+        return False
+    try:
+        page.wait_for_selector(_REVIEW_PANEL_COMBINED_SELECTOR, timeout=6000)
+        return True
+    except Exception:
+        return False
 
 
 def _js_click_reviews_tab(page) -> bool:
@@ -1415,8 +1808,27 @@ def _disambiguate_maps_query(query: str, company_data: Dict[str, str] = None) ->
         if domain.startswith(prefix):
             domain = domain[len(prefix):]
     domain = domain.split("/")[0].strip()
-    if not domain or domain.lower() in query.lower():
+    if not domain:
         return query
+
+    # FIX: previously returned `query` unchanged whenever the domain's word
+    # tokens were already a subset of the query's tokens (e.g. "boAt
+    # Lifestyle" already contains "boat"+"lifestyle", the same tokens in
+    # "boat-lifestyle.com") on the theory that appending the domain would
+    # be redundant. In production this was the exact case that still
+    # single-result-redirected to an unrelated business ("LIFE STYLE
+    # TOWN") - Maps' fuzzy text matcher works on the literal search
+    # string, not a token set, so a shared *word* doesn't mean a shared
+    # *string*, and the one extra signal that might have disambiguated it
+    # (the literal domain text) was being withheld precisely when the
+    # token-overlap heuristic said "not needed". Appending the domain
+    # even when it "looks redundant" costs nothing when Maps already had
+    # enough to go on, and is exactly the extra specificity needed when it
+    # didn't - so always append it when we have one.
+    # Always append the domain (see the fix note above for why the old
+    # "skip if tokens already overlap" conditional was removed) - the
+    # comparison logic that used to live here is gone; this is now a
+    # straight, unconditional append.
     return f"{query} {domain}"
 
 
@@ -1436,16 +1848,52 @@ def _scrape_maps(page, query: str, time_left, company_data: Dict[str, str] = Non
         "?hl=en&gl=in"
     )
 
-    if not _goto_with_retry(page, maps_url, timeout=_adaptive_nav_timeout(time_left), time_left=time_left):
+    # This is the one navigation that sits in front of the candidate scan,
+    # so it reserves time for the settle/layout-detection step AND the scan
+    # itself (_INITIAL_NAV_RESERVE_SECONDS) - without this reservation,
+    # adaptive-timeout retries can legally consume down to a few seconds
+    # remaining, which is below what the scan needs to even attempt, and
+    # BUSINESS_NOT_FOUND follows immediately even though the layout was
+    # correctly detected as search_results.
+    # DIAGNOSTIC: this specific call is the only place DIAG_NAV_FAILURE /
+    # "nav_failure" debug artifacts are produced (see _log_diag call just
+    # below), but until now it sat after the last BROWSER_TRACE checkpoint
+    # (after_new_page) with no trace of its own — so a "nav_failure" debug
+    # artifact could not distinguish "this navigation had barely any time
+    # budget left by the time it started" from "it had a full budget and
+    # still failed/hung." Added after finding both patterns in the same
+    # debug/ folder across companies (some final_url: about:blank, others a
+    # real Maps search URL — i.e. navigation partly succeeded before the
+    # wait condition timed out) with no way to tell which from existing
+    # logs alone. Pure logging; no behavior change.
+    logger.info(
+        "BROWSER_TRACE scraper=Google event=before_maps_search_nav elapsed=%.3fs "
+        "timestamp=%.3f thread=%s time_left=%.1fs",
+        time.monotonic() - getattr(_browser_trace, "ensure_context_started_at", time.monotonic()),
+        time.time(), threading.current_thread().name, time_left(),
+    )
+    _maps_nav_ok = _goto_with_retry(
+        page, maps_url, timeout=_adaptive_nav_timeout(time_left), time_left=time_left,
+        reserve_seconds=_INITIAL_NAV_RESERVE_SECONDS,
+    )
+    logger.info(
+        "BROWSER_TRACE scraper=Google event=after_maps_search_nav elapsed=%.3fs "
+        "timestamp=%.3f thread=%s ok=%s time_left=%.1fs",
+        time.monotonic() - getattr(_browser_trace, "ensure_context_started_at", time.monotonic()),
+        time.time(), threading.current_thread().name, _maps_nav_ok, time_left(),
+    )
+    if not _maps_nav_ok:
         _log_diag(DIAG_NAV_FAILURE, query, "initial Maps navigation failed after retries")
         _save_debug_artifacts(page, query, "nav_failure")
         return texts, False
 
-    # Bumped from 1200ms: this is the initial settle wait before we start
-    # polling for the results list, and the previous value was tight enough
-    # that a slow-rendering results list could still read as "not there yet"
-    # on the very first selector check.
-    page.wait_for_timeout(1800)
+    # Budget-aware settle wait: poll for either a search-results or a
+    # business-page indicator instead of always sleeping a fixed 1800ms.
+    # Exits as soon as one appears; only pays the full window when neither
+    # has rendered yet, and never waits longer than what was reserved for
+    # this phase (_SETTLE_RESERVE_SECONDS) or than what's actually left.
+    settle_budget_ms = max(0, min(int(_SETTLE_RESERVE_SECONDS * 1000), int(time_left() * 1000)))
+    _wait_for_layout_ready(page, settle_budget_ms)
     _dismiss_consent(page)
     page.wait_for_timeout(300)
 
@@ -1466,17 +1914,51 @@ def _scrape_maps(page, query: str, time_left, company_data: Dict[str, str] = Non
 
     clicked_into_place = False
     best_match_score = 0
+    target_name = (company_data or {}).get("company_name", query) or query
 
     if layout == "business_page":
-        # Nothing to click - we're already on the place detail page.
-        clicked_into_place = True
-        logger.info(
-            "Already on a business detail page for query=%r "
-            "(single-result redirect); skipping result-list click.",
-            query,
-        )
+        # Nothing to click - we're already on the place detail page. But
+        # don't just trust that: verify the name actually rendered on this
+        # page plausibly is the target company before treating it as a
+        # real match. See _business_name_matches_target()'s docstring for
+        # the production incident (a query for "boAt Lifestyle" silently
+        # redirecting to an unrelated business called "LIFE STYLE TOWN")
+        # this specifically guards against.
+        landed_name = _extract_business_page_name(page)
+        if landed_name and not _business_name_matches_target(landed_name, target_name):
+            logger.warning(
+                "Maps single-result-redirected to %r for query=%r, but that "
+                "name doesn't plausibly match the target company - "
+                "treating as no match instead of scraping the wrong "
+                "business's reviews.",
+                landed_name, query,
+            )
+            _log_diag(
+                DIAG_BUSINESS_MISMATCH, query,
+                f"single-result redirect landed on {landed_name!r}, which "
+                f"does not match target company name {target_name!r}",
+            )
+            clicked_into_place = False
+        else:
+            clicked_into_place = True
+            if landed_name:
+                logger.info(
+                    "Already on a business detail page for query=%r "
+                    "(single-result redirect); name %r matches target - "
+                    "skipping result-list click.",
+                    query, landed_name,
+                )
+            else:
+                # Couldn't read a name to verify against (selector churn,
+                # slow render) - proceed as before rather than blocking on
+                # a check that itself failed to produce a signal either way.
+                logger.info(
+                    "Already on a business detail page for query=%r "
+                    "(single-result redirect); could not read a name to "
+                    "verify against, proceeding anyway.",
+                    query,
+                )
     else:
-        target_name = (company_data or {}).get("company_name", query) or query
         target_website = (company_data or {}).get("website", "") or ""
         # Compare by bare domain, not the full URL: target_website is
         # usually "https://www.example.com", which can never appear
@@ -1609,157 +2091,314 @@ def _scrape_maps(page, query: str, time_left, company_data: Dict[str, str] = Non
             )
             return False
 
+        def _extract_candidate_name_and_link(node) -> Tuple[str, str]:
+            """Resolve a candidate's display name and navigable href.
+
+            Shared by the single-pass scan below and by nothing else now
+            that scoring/clicking are decoupled from selector iteration -
+            kept as its own function purely so the extraction rules (anchor
+            resolution, aria-label-first name lookup, heading fallbacks)
+            stay in one place instead of being duplicated per candidate.
+            """
+            try:
+                own_href = node.get_attribute("href") or ""
+            except Exception:
+                own_href = ""
+
+            # BUGFIX: this used to treat ANY href present on `node` as good
+            # enough to use directly ("if node.get_attribute('href')..."),
+            # which meant the broad selectors in _PLACE_RESULT_SELECTORS
+            # (needed because a card's real place-link doesn't always match
+            # the narrower a.hfpxzc / a[href*='/maps/place/'] patterns) also
+            # picked up non-place action links inside the same result card -
+            # most importantly the "Visit <business>'s website" button,
+            # whose href is the business's own external site, not a Maps
+            # place page. That external href still contains the target
+            # site's domain, so it used to win the +100 domain-match bonus
+            # in _score_candidate() below outright, get selected as the
+            # "best" candidate, and - since it can never navigate to a
+            # "/maps/place/..." URL - burn the entire click-retry budget
+            # before failing, while the real place result never got
+            # clicked at all (this is exactly the BUSINESS_NOT_FOUND /
+            # 0-review failure seen in production for a query where a
+            # *different* nearby business's "visit website" link happened
+            # to point at our target's domain).
+            #
+            # Fix: only ever trust `node` itself as the anchor when its own
+            # href is an actual place-detail link. For every other node
+            # (a container, or an action-button anchor), look for a nested
+            # place-detail anchor instead, and treat "no such nested anchor"
+            # as "this candidate has no navigable place link" - not as
+            # license to fall back to whatever unrelated href happened to
+            # be sitting on the node (see the removed fallback below too).
+            if "/maps/place/" in own_href:
+                anchor = node
+            else:
+                try:
+                    anchor = node.locator("a[href*='/maps/place/']").first
+                    if anchor.count() == 0:
+                        anchor = None
+                except Exception:
+                    anchor = None
+
+            name_text = ""
+            if anchor is not None:
+                try:
+                    name_text = (anchor.get_attribute("aria-label") or "").strip()
+                except Exception:
+                    name_text = ""
+            if not name_text:
+                for name_sel in (
+                    "h1, h2, .fontHeadlineSmall, [role='heading']",
+                    "div.qBF1Pd, span.qBF1Pd",
+                    "div[class*='fontHeadlineSmall'], span[class*='fontHeadlineSmall']",
+                ):
+                    try:
+                        name_el = node.locator(name_sel).first
+                        if name_el.count() > 0:
+                            name_text = name_el.inner_text(timeout=1000).strip()
+                            if name_text:
+                                break
+                    except Exception:
+                        continue
+
+            # No fallback to `own_href` here on purpose: if `anchor` is
+            # None, this candidate has no resolvable place-detail link, and
+            # scoring/clicking a non-place href (website/call/directions/
+            # share/etc.) as if it were navigable is exactly the bug fixed
+            # above. An empty link here just means _score_candidate() below
+            # can't award the domain-match bonus for this candidate, which
+            # is correct - it also can't be clicked into a place page.
+            link = ""
+            try:
+                link = (anchor.get_attribute("href") if anchor is not None else "") or ""
+            except Exception:
+                link = ""
+
+            return name_text, link
+
+        def _score_candidate(name_text: str, link: str) -> int:
+            """Same scoring rubric as before: name-similarity + website match.
+
+            The domain-match bonus is only ever awarded to a genuine
+            "/maps/place/..." link. `link` coming out of
+            `_extract_candidate_name_and_link` is already guaranteed to be
+            either such a place-detail href or empty (never a "visit
+            website"/call/directions action link), but the explicit
+            "/maps/place/" check is kept here too as defense-in-depth: a
+            future caller of this scoring function should not be able to
+            silently reintroduce the "domain-matched non-place link wins
+            outright" bug just by passing in a differently-sourced link.
+            """
+            score = 0
+            if name_text:
+                name_lower = name_text.lower()
+                if target_name.lower() in name_lower:
+                    score += 80
+                else:
+                    similarity = SequenceMatcher(None, target_name.lower(), name_lower).ratio()
+                    if similarity >= 0.6:
+                        score += int(similarity * 80)
+            link_lower = link.lower()
+            if target_domain and "/maps/place/" in link_lower and target_domain in link_lower:
+                score += 100
+            return score
+
+        # --- OPTIMIZATION: candidate collection, scoring, and clicking are
+        # now three decoupled steps instead of one tightly-coupled loop.
+        #
+        # Previously this called page.wait_for_selector(selector,
+        # timeout=6000) once per entry in _PLACE_RESULT_SELECTORS,
+        # sequentially, and scored+clicked candidates inline as each
+        # selector was visited (worst case ~6s x 7 selectors = 42s just to
+        # discover candidates, before any scoring/clicking time is spent).
+        #
+        # Step A - single DOM scan: one combined wait_for_selector() across
+        # every known place-result pattern, then one pass collecting every
+        # currently-visible candidate each pattern resolves. No further
+        # per-selector waiting - by this point in _scrape_maps the page has
+        # already had its settle waits, consent dismissal, and layout
+        # detection, so the results (if any) are already in the DOM.
+        # Step B - score every candidate collected in step A.
+        # Step C - click exactly once, on the single highest-scoring
+        # candidate.
         logger.debug(
-            "[PLACE_RESULT] entering place-result selector loop for query=%r: "
-            "time_left=%.1fs, min_required=%.1fs, %d selector(s) queued.",
+            "[PLACE_RESULT] starting single-pass candidate scan for query=%r: "
+            "time_left=%.1fs, min_required=%.1fs, %d selector pattern(s).",
             query, time_left(), _PLACE_RESULT_LOOP_MIN_TIME_SECONDS,
             len(_PLACE_RESULT_SELECTORS),
         )
-        for _sel_idx, selector in enumerate(_PLACE_RESULT_SELECTORS):
-            if time_left() <= _PLACE_RESULT_LOOP_MIN_TIME_SECONDS:
-                logger.warning(
-                    "[PLACE_RESULT] aborting place-result loop for query=%r: "
-                    "only %.1fs left (need >%.1fs) at selector %d/%d (%r) - "
-                    "%d selector(s) never attempted.",
-                    query, time_left(), _PLACE_RESULT_LOOP_MIN_TIME_SECONDS,
-                    _sel_idx + 1, len(_PLACE_RESULT_SELECTORS), selector,
-                    len(_PLACE_RESULT_SELECTORS) - _sel_idx,
-                )
-                break
+
+        scored_candidates = []  # list of (score, name_text, link, element)
+
+        if time_left() <= _PLACE_RESULT_LOOP_MIN_TIME_SECONDS:
+            logger.warning(
+                "[PLACE_RESULT] skipping candidate scan for query=%r: only "
+                "%.1fs left (need >%.1fs).",
+                query, time_left(), _PLACE_RESULT_LOOP_MIN_TIME_SECONDS,
+            )
+        else:
+            # Step A: one combined wait replaces the old per-selector waits.
+            combined_selector = ", ".join(_PLACE_RESULT_SELECTORS)
             try:
-                page.wait_for_selector(selector, timeout=6000)
+                page.wait_for_selector(combined_selector, timeout=6000)
                 logger.debug(
-                    "[PLACE_RESULT] selector %d/%d (%r) matched for query=%r "
-                    "(time_left=%.1fs).",
-                    _sel_idx + 1, len(_PLACE_RESULT_SELECTORS), selector,
-                    query, time_left(),
+                    "[PLACE_RESULT] combined selector matched for query=%r "
+                    "(time_left=%.1fs).", query, time_left(),
                 )
-            except Exception as _sel_exc:
+            except Exception as _scan_exc:
+                logger.info(
+                    "PLACE_RESULT_TRACE mode=scan matched_elements=0 "
+                    "selector_error=%s", _scan_exc,
+                )
                 logger.debug(
-                    "[PLACE_RESULT] selector %d/%d (%r) did not match for "
-                    "query=%r within 6000ms (time_left=%.1fs): %s",
-                    _sel_idx + 1, len(_PLACE_RESULT_SELECTORS), selector,
-                    query, time_left(), _sel_exc,
+                    "[PLACE_RESULT] no place-result element matched any "
+                    "known selector for query=%r within 6000ms "
+                    "(time_left=%.1fs).", query, time_left(),
                 )
-                continue
-            try:
-                results = page.locator(selector).all()
-                logger.debug(
-                    "[PLACE_RESULT] selector %r resolved %d candidate node(s) "
-                    "for query=%r.",
-                    selector, len(results), query,
+
+            # One pass over the now-settled DOM: gather every visible
+            # candidate from every selector pattern (locator().all() here
+            # does not itself wait). De-duplicate on (name, href) since
+            # several patterns above resolve the same underlying cards.
+            seen = set()
+            results = []
+            for selector in _PLACE_RESULT_SELECTORS:
+                try:
+                    matched = page.locator(selector).all()
+                except Exception:
+                    continue
+                results.extend(matched)
+                logger.info(
+                    "PLACE_RESULT_TRACE mode=scan selector=%r matched_elements=%d",
+                    selector, len(matched),
                 )
-                for result in results[:5]:  # limited candidates
-                    if time_left() <= 12:
-                        break
-                    try:
-                        # --- Resolve the actual navigable link for this
-                        # candidate. `result` is already the anchor when
-                        # the matched selector targets `a[...]` directly;
-                        # otherwise look for the place-link anchor nested
-                        # inside the card/article wrapper so step 3 below
-                        # can click that instead of the (non-navigating)
-                        # container. Falls back to the container itself
-                        # only if no such anchor exists in this DOM variant.
-                        if result.get_attribute("href") or "":
-                            anchor = result
-                        else:
-                            anchor = result.locator("a[href*='/maps/place/']").first
-                            if anchor.count() == 0:
-                                anchor = None
 
-                        # --- Name lookup across current Maps search-card
-                        # DOM variants. The anchor's own aria-label is the
-                        # most stable source - Maps puts the full business
-                        # name there regardless of which obfuscated class
-                        # the visible title div/span currently uses - so
-                        # it's tried first; the original heading-tag
-                        # selectors plus a couple of additional class
-                        # variants remain as fallbacks for layouts where
-                        # the aria-label is missing or generic.
-                        name_text = ""
-                        if anchor is not None:
-                            name_text = (anchor.get_attribute("aria-label") or "").strip()
-                        if not name_text:
-                            for name_sel in (
-                                "h1, h2, .fontHeadlineSmall, [role='heading']",
-                                "div.qBF1Pd, span.qBF1Pd",
-                                "div[class*='fontHeadlineSmall'], span[class*='fontHeadlineSmall']",
-                            ):
-                                name_el = result.locator(name_sel).first
-                                if name_el.count() > 0:
-                                    name_text = name_el.inner_text(timeout=1000).strip()
-                                    if name_text:
-                                        break
-
-                        link = (anchor.get_attribute("href") if anchor is not None else "") or ""
-                        if not link:
-                            link = result.get_attribute("href") or ""
-
-                        score = 0
-                        if name_text:
-                            name_lower = name_text.lower()
-                            if target_name.lower() in name_lower:
-                                score += 80
-                            else:
-                                # Fuzzy fallback: a strict substring check
-                                # scores a near-match (e.g. an extra
-                                # "- Corporate Office" suffix, or minor
-                                # punctuation/spacing differences) as a
-                                # complete miss even though it's clearly
-                                # the right business.
-                                similarity = SequenceMatcher(None, target_name.lower(), name_lower).ratio()
-                                if similarity >= 0.6:
-                                    score += int(similarity * 80)
-                        if target_domain and target_domain in link.lower():
-                            score += 100
-
-                        if score > best_match_score:
-                            best_match_score = score
-                            click_target = anchor if anchor is not None else result
-                            if _click_place_result(click_target, query):
-                                clicked_into_place = True
-                                logger.info(
-                                    "Google Maps matched business: %r (score=%d) for query=%r",
-                                    name_text, score, query,
-                                )
-                                break
-                            # Click didn't actually navigate anywhere - undo
-                            # the score claim so a lower-scoring candidate
-                            # further down the list still gets a chance
-                            # instead of being blocked by a match that
-                            # never landed.
-                            logger.info(
-                                "Click did not navigate to a place page for "
-                                "candidate %r (score=%d, query=%r); trying "
-                                "the next candidate instead.",
-                                name_text, score, query,
-                            )
-                            best_match_score = 0
-                    except Exception:
-                        continue
-                if clicked_into_place:
-                    break
-                if results:
-                    # Every remaining selector in _PLACE_RESULT_SELECTORS
-                    # resolves the same underlying result cards this one
-                    # already did - re-evaluating them cannot produce a
-                    # different outcome, and each extra selector costs up
-                    # to 6s of wait_for_selector time. Observed live: all
-                    # candidates scoring 0 here (business genuinely absent
-                    # from Maps - e.g. an online-only D2C brand) and then
-                    # 12s+ burning on the remaining selectors, leaving the
-                    # search/Bing fallbacks no budget at all.
+            for _candidate_idx, node in enumerate(results[:20], start=1):
+                if time_left() <= _PLACE_RESULT_LOOP_MIN_TIME_SECONDS:
                     logger.info(
-                        "[PLACE_RESULT] %d candidate(s) evaluated with no "
-                        "acceptable match for query=%r; skipping the "
-                        "remaining selectors (same underlying results) so "
-                        "the fallbacks get the time budget instead.",
-                        len(results), query,
+                        "PLACE_RESULT_TRACE mode=scan candidate_index=%d "
+                        "candidate_skipped=time_budget", _candidate_idx,
                     )
                     break
+                try:
+                    if not node.is_visible():
+                        continue
+                    name_text, link = _extract_candidate_name_and_link(node)
+                    key = (name_text, link)
+                    if not (name_text or link) or key in seen:
+                        continue
+                    seen.add(key)
+                    score = _score_candidate(name_text, link)
+                    scored_candidates.append((score, name_text, link, node))
+                    logger.info(
+                        "PLACE_RESULT_TRACE mode=scan candidate_index=%d "
+                        "name=%r href=%r score=%d",
+                        _candidate_idx, name_text, link, score,
+                    )
+                except Exception as _candidate_exc:
+                    logger.info(
+                        "PLACE_RESULT_TRACE mode=scan candidate_index=%d "
+                        "candidate_error=%s", _candidate_idx, _candidate_exc,
+                    )
+                    continue
+
+        # DIAGNOSTIC ONLY - no effect on which candidate gets clicked.
+        #
+        # GAP FOUND (2026-07-31, code-review only): _score_candidate only
+        # measures name-similarity-to-target and a website-domain-match
+        # bonus - it has no way to tell "this is the one genuine business
+        # matching this name" apart from "this is one of many separate
+        # physical locations of the same chain/franchise, each with its
+        # own Maps listing, none of which represents the company as a
+        # whole." A multi-location business (e.g. a restaurant chain) can
+        # have every one of its outlets score identically high here, and
+        # max() then picks whichever one happens to appear first in DOM
+        # order - which Maps' own ranking (often geolocation/IP-dependent)
+        # controls, not this code. Confirmed this is a real, not
+        # hypothetical, case for at least one company this app has been
+        # asked to analyze: India's KFC outlets are run by large multi-
+        # city franchise operators (Devyani International / Sapphire
+        # Foods) with hundreds of separate physical locations, not a
+        # single "KFC" business entity Maps could point at - there is no
+        # single Maps listing whose reviews would genuinely represent
+        # "KFC" the brand.
+        #
+        # This doesn't change which candidate gets clicked (that could
+        # regress a working case on a heuristic that hasn't been
+        # validated against a real run yet) - it only makes the ambiguity
+        # visible in the log, so a real run against a chain-style company
+        # can be recognized rather than silently treated as a normal
+        # single-location result. If a fresh log confirms this actually
+        # fires for chain businesses, the next step is deciding what
+        # policy to apply (skip Maps for that job, label the result as
+        # "not necessarily representative", etc.) - a product decision,
+        # not one this code should make unilaterally.
+        _strong_matches = [c for c in scored_candidates if c[0] >= 70]
+        if len(_strong_matches) >= 3:
+            _distinct_names = list({c[1] for c in _strong_matches if c[1]})
+            logger.warning(
+                "DIAG_MULTI_LOCATION_SUSPECTED query=%r: %d of %d scanned "
+                "candidates scored >=70 (strong name match) at once - a "
+                "single genuine business rarely has this many separately-"
+                "listed strong matches; this usually means a multi-"
+                "location chain/franchise, not one business. Names seen: "
+                "%r. The candidate that gets clicked below is still just "
+                "the single highest scorer among these - treat its "
+                "reviews as one location's data, not necessarily "
+                "representative of the whole brand.",
+                query, len(_strong_matches), len(scored_candidates),
+                _distinct_names[:10],
+            )
+
+        # Step B/C: pick the single highest-scoring candidate (first one
+        # wins any tie) and attempt exactly one click/navigation on it.
+        if scored_candidates:
+            best_match_score, best_name, best_link, best_node = max(
+                scored_candidates, key=lambda c: c[0]
+            )
+            best_anchor = best_node
+            try:
+                if not (best_node.get_attribute("href") or ""):
+                    _nested = best_node.locator("a[href*='/maps/place/']").first
+                    if _nested.count() > 0:
+                        best_anchor = _nested
             except Exception:
-                continue
+                best_anchor = best_node
+
+            logger.info(
+                "[PLACE_RESULT] %d candidate(s) scanned for query=%r; "
+                "selected best candidate name=%r href=%r score=%d for the "
+                "single click attempt.",
+                len(scored_candidates), query, best_name, best_link, best_match_score,
+            )
+
+            click_succeeded = _click_place_result(best_anchor, query)
+            click_result = "success" if click_succeeded else "failed"
+            logger.info(
+                "PLACE_RESULT_TRACE mode=click name=%r href=%r score=%d "
+                "click_result=%s",
+                best_name, best_link, best_match_score, click_result,
+            )
+            if click_succeeded:
+                clicked_into_place = True
+                logger.info(
+                    "Google Maps matched business: %r (score=%d) for query=%r",
+                    best_name, best_match_score, query,
+                )
+            else:
+                logger.info(
+                    "Click did not navigate to a place page for the best "
+                    "candidate %r (score=%d, query=%r); no further "
+                    "candidates are attempted.",
+                    best_name, best_match_score, query,
+                )
+                best_match_score = 0
+        else:
+            logger.info(
+                "[PLACE_RESULT] no candidates found in the single DOM scan "
+                "for query=%r; nothing to click.", query,
+            )
 
         if not clicked_into_place:
             # The layout classifier's first pass ran with a small time
@@ -2141,6 +2780,30 @@ def _scrape_search_fallback(page, query: str, time_left) -> Tuple[List[str], boo
     return texts, False
 
 
+# How much time Bing's navigation must leave behind for the DuckDuckGo
+# fallback that always runs after it (in both _scrape_sync and
+# _scrape_sync_product - see the "Google search -> Bing -> DuckDuckGo"
+# chain description in ARCHITECTURE.md §4.5). Matches _scrape_ddg_fallback's
+# own `min(8.0, time_left())` request.
+#
+# FIXED (2026-07-30, live-log-driven): _scrape_bing_fallback used to call
+# _goto_with_retry with no `reserve_seconds`, so its two-attempt retry loop
+# (see _goto_with_retry) could legally burn the ENTIRE remaining budget
+# down to nothing before DuckDuckGo ever got a turn. Confirmed via a live
+# log where two separate product queries each spent ~15-16s across Bing's
+# two failed nav attempts, after which DuckDuckGo was never even attempted
+# - it was silently skipped by its own `time_left() <= 3` guard, with no
+# log line at all, which made it look like DDG "didn't run" rather than
+# an obvious starvation failure. This mattered because DuckDuckGo is the
+# one tier in this chain that's actually reliable here (plain httpx GET,
+# no browser, no bot-wall observed - see _scrape_ddg_fallback's own
+# docstring), while Bing is browser-based and was failing 2/2 attempts on
+# both queries in that same log - i.e. the least reliable tier was starving
+# the most reliable one. This reserve guarantees DuckDuckGo gets a real
+# shot regardless of how Bing's navigation goes.
+_DDG_RESERVE_SECONDS = 8.0
+
+
 def _scrape_bing_fallback(page, query: str, time_left) -> List[str]:
     texts: List[str] = []
     # Broad "<query> reviews" query. The previous
@@ -2151,7 +2814,10 @@ def _scrape_bing_fallback(page, query: str, time_left) -> List[str]:
     search_q = f"{query} reviews"
     url = f"https://www.bing.com/search?q={search_q.replace(' ', '+')}"
 
-    if not _goto_with_retry(page, url, timeout=_adaptive_nav_timeout(time_left), time_left=time_left, retries=1):
+    if not _goto_with_retry(
+        page, url, timeout=_adaptive_nav_timeout(time_left), time_left=time_left,
+        retries=1, reserve_seconds=_DDG_RESERVE_SECONDS,
+    ):
         return texts
 
     page.wait_for_timeout(1200)
@@ -2211,12 +2877,14 @@ def _scrape_ddg_fallback(query: str, time_left) -> List[str]:
     return texts[: min(MAX_GOOGLE_REVIEWS, 50)]
 
 
-def _scrape_sync(query: str, company_data: Dict[str, str] = None) -> List[str]:
+def _scrape_sync(
+    query: str, company_data: Dict[str, str], queued_at: float,
+) -> List[str]:
     if sys.platform.startswith("win"):
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
     setup_start = time.monotonic()
-    start = setup_start  # Fix #1: always defined for elapsed logging
+    start = queued_at
 
     try:
         context = _ensure_context()
@@ -2228,52 +2896,131 @@ def _scrape_sync(query: str, company_data: Dict[str, str] = None) -> List[str]:
     bot_checked_any = False
     page = None
     try:
+        logger.info(
+            "BROWSER_TRACE scraper=Google event=before_new_page elapsed=%.3fs timestamp=%.3f thread=%s",
+            time.monotonic() - getattr(_browser_trace, "ensure_context_started_at", time.monotonic()), time.time(), threading.current_thread().name,
+        )
         page = context.new_page()
+        logger.info(
+            "BROWSER_TRACE scraper=Google event=after_new_page elapsed=%.3fs timestamp=%.3f thread=%s",
+            time.monotonic() - getattr(_browser_trace, "ensure_context_started_at", time.monotonic()), time.time(), threading.current_thread().name,
+        )
         page.set_default_timeout(8000)
 
-        # The internal time budget clock starts here, only AFTER browser
-        # launch, context creation, and page creation have all finished -
-        # not before. Starting the clock earlier meant Chromium/context
-        # startup time silently ate into the budget before navigation ever
-        # got a chance to run.
+        # FIX (the real root cause of Google returning 0 comments - see the
+        # OUTER_HARD_TIMEOUT_SECONDS block near the top of this file for
+        # the full writeup): the previous version of this fix started a
+        # FRESH TIME_BUDGET_SECONDS clock here, after setup finished,
+        # instead of the queued_at/`start` clock app.py's outer 48s
+        # wait_for() has actually been counting against since this job
+        # began. That solved the OLDER bug (setup eating the entire budget
+        # before a single navigation was attempted) but introduced this
+        # one: setup(17.4s) + a fresh 35s totalled ~52.4s, a few seconds
+        # OVER app.py's 48s cap - and because that cap is a hard
+        # asyncio.wait_for() cliff, not a soft budget, every caller gave up
+        # at 48.0s while this scrape kept running unseen and finished at
+        # 50.0s with 3 real reviews that never reached the dashboard.
+        #
+        # Fixed the same way as twitter_scraper.py/instagram_scraper.py/
+        # youtube_scraper.py: one real wall-clock deadline anchored to
+        # `start` (== queued_at, captured before this job was even
+        # submitted to the executor - see scrape_google_reviews()), via
+        # OUTER_HARD_TIMEOUT_SECONDS - SAFETY_MARGIN_SECONDS, so this
+        # always leaves real margin for the result to make it back through
+        # run_in_executor()/asyncio.shield()/wait_for(), no matter how
+        # long setup took. TIME_BUDGET_SECONDS is kept only as the
+        # "no contention at all" reference value its own comment still
+        # describes; it is no longer what deadline/time_left() below
+        # actually use.
         setup_elapsed = time.monotonic() - setup_start
-        start = time.monotonic()
-        deadline = start + TIME_BUDGET_SECONDS
+        elapsed_since_job_start = time.monotonic() - start
+        deadline = start + OUTER_HARD_TIMEOUT_SECONDS - SAFETY_MARGIN_SECONDS
+        remaining_budget = deadline - time.monotonic()
         logger.info(
-            "Google reviews scrape: browser/context/page setup took %.1fs; "
-            "starting %ds navigation+scrape budget now.",
-            setup_elapsed, TIME_BUDGET_SECONDS,
+            "Google reviews scrape: browser/context/page setup took %.1fs "
+            "(%.1fs elapsed since job start); %.1fs left for "
+            "navigation+scrape before the safety-margined internal "
+            "deadline (outer cap=%ds, safety margin=%.1fs).",
+            setup_elapsed, elapsed_since_job_start, remaining_budget,
+            OUTER_HARD_TIMEOUT_SECONDS, SAFETY_MARGIN_SECONDS,
         )
 
         def time_left() -> float:
             return deadline - time.monotonic()
 
-        try:
-            maps_texts, hit_bot_check = _scrape_maps(page, query, time_left, company_data)
-            raw_results.extend(maps_texts)
-            bot_checked_any = bot_checked_any or hit_bot_check
-        except Exception:
-            logger.exception("Maps scrape failed for query=%r.", query)
+        if remaining_budget <= MIN_USEFUL_BUDGET_SECONDS:
+            logger.warning(
+                "Google reviews scrape: only %.1fs left for query=%r after "
+                "a %.1fs setup (job start to now: %.1fs) - not enough time "
+                "to attempt navigation; returning early instead of risking "
+                "the outer hard timeout.",
+                remaining_budget, query, setup_elapsed,
+                time.monotonic() - start,
+            )
+        else:
+            # STAGE_TRACE: added 2026-08-03 after a live log showed this
+            # company-wide ("General") path finishing in 222s-381s for two
+            # of four companies tested, against a ~37s internal deadline -
+            # while setup and the Maps-navigation step (see the
+            # before/after_maps_search_nav BROWSER_TRACE lines added
+            # earlier this session) both measured correctly bounded in
+            # that same log. Every fallback stage below (_scrape_maps's
+            # own nav retries, _scrape_search_fallback,
+            # _scrape_bing_fallback, _scrape_ddg_fallback) has an
+            # explicit, correctly-computed timeout when read in isolation
+            # - nothing here proves which one actually ran long. These
+            # entry/exit markers, labeled COMPANY_WIDE specifically (the
+            # existing "PRODUCT search" log lines already distinguish
+            # themselves, but this path's own lines didn't), exist so the
+            # next live run shows exactly which stage the elapsed time
+            # actually went into, instead of requiring another guess.
+            def _stage_trace(stage: str, event: str) -> None:
+                logger.info(
+                    "STAGE_TRACE scraper=Google path=COMPANY_WIDE query=%r "
+                    "stage=%s event=%s elapsed_since_job_start=%.1fs",
+                    query, stage, event, time.monotonic() - start,
+                )
 
-        if len(raw_results) < MAX_GOOGLE_REVIEWS and time_left() > 8:
+            _stage_trace("maps", "before")
             try:
-                search_texts, hit_bot_check = _scrape_search_fallback(page, query, time_left)
-                raw_results.extend(search_texts)
+                maps_texts, hit_bot_check = _scrape_maps(page, query, time_left, company_data)
+                raw_results.extend(maps_texts)
                 bot_checked_any = bot_checked_any or hit_bot_check
             except Exception:
-                logger.exception("Search fallback failed for query=%r.", query)
+                logger.exception("Maps scrape failed for query=%r.", query)
+            _stage_trace("maps", "after")
 
-        if len(raw_results) < min(5, MAX_GOOGLE_REVIEWS) and time_left() > 6:
-            try:
-                raw_results.extend(_scrape_bing_fallback(page, query, time_left))
-            except Exception:
-                logger.exception("Bing fallback failed for query=%r.", query)
+            if len(raw_results) < MAX_GOOGLE_REVIEWS and time_left() > 8:
+                _stage_trace("search_fallback", "before")
+                try:
+                    search_texts, hit_bot_check = _scrape_search_fallback(page, query, time_left)
+                    raw_results.extend(search_texts)
+                    bot_checked_any = bot_checked_any or hit_bot_check
+                except Exception:
+                    logger.exception("Search fallback failed for query=%r.", query)
+                _stage_trace("search_fallback", "after")
 
-        if len(raw_results) < min(5, MAX_GOOGLE_REVIEWS) and time_left() > 3:
-            try:
-                raw_results.extend(_scrape_ddg_fallback(query, time_left))
-            except Exception:
-                logger.exception("DuckDuckGo fallback failed for query=%r.", query)
+            # Threshold raised 6 -> _DDG_RESERVE_SECONDS + 2 (10s): Bing now
+            # reserves _DDG_RESERVE_SECONDS for DuckDuckGo internally (see
+            # that constant's comment), so entering with only 6-10s left
+            # meant Bing's own navigable time was clamped to ~0-2s before
+            # it even tried - not enough for a real attempt, just wasted
+            # overhead ahead of the DDG step it was already starving.
+            if len(raw_results) < min(5, MAX_GOOGLE_REVIEWS) and time_left() > _DDG_RESERVE_SECONDS + 2:
+                _stage_trace("bing_fallback", "before")
+                try:
+                    raw_results.extend(_scrape_bing_fallback(page, query, time_left))
+                except Exception:
+                    logger.exception("Bing fallback failed for query=%r.", query)
+                _stage_trace("bing_fallback", "after")
+
+            if len(raw_results) < min(5, MAX_GOOGLE_REVIEWS) and time_left() > 3:
+                _stage_trace("ddg_fallback", "before")
+                try:
+                    raw_results.extend(_scrape_ddg_fallback(query, time_left))
+                except Exception:
+                    logger.exception("DuckDuckGo fallback failed for query=%r.", query)
+                _stage_trace("ddg_fallback", "after")
     finally:
         if page is not None:
             try:
@@ -2288,7 +3035,7 @@ def _scrape_sync(query: str, company_data: Dict[str, str] = None) -> List[str]:
                 "Bot-check triggered for query=%r; recycling browser context on %s.",
                 query, threading.current_thread().name,
             )
-            _teardown_thread_browser()
+            _teardown_thread_browser(reason="bot_detection")
 
     elapsed = time.monotonic() - start
     logger.info(
@@ -2316,39 +3063,199 @@ def _scrape_sync(query: str, company_data: Dict[str, str] = None) -> List[str]:
     )
     if len(final) == 0:
         logger.warning("Zero reviews collected for %r — check logs for genuine absence vs scrape failure.", query)
-        if total_elapsed >= TIME_BUDGET_SECONDS - 1:
+        # Compare against the anchored working budget (OUTER_HARD_TIMEOUT_
+        # SECONDS - SAFETY_MARGIN_SECONDS, counted from job start), not the
+        # old fixed TIME_BUDGET_SECONDS - see the fix above for why.
+        # `deadline` and `start` are always set by this point since they're
+        # assigned right after page setup, before any of the try/except-
+        # wrapped scrape calls that could otherwise skip them.
+        working_budget_total = OUTER_HARD_TIMEOUT_SECONDS - SAFETY_MARGIN_SECONDS
+        scrape_phase_elapsed = working_budget_total - (deadline - time.monotonic())
+        if scrape_phase_elapsed >= working_budget_total - 1:
             _log_diag(
                 DIAG_TIMEOUT, query,
-                f"internal time budget ({TIME_BUDGET_SECONDS}s) nearly/fully exhausted "
-                f"(elapsed={total_elapsed:.1f}s) before any reviews were collected",
+                f"internal time budget ({working_budget_total:.1f}s, anchored "
+                f"to job start with an {SAFETY_MARGIN_SECONDS:.1f}s safety "
+                f"margin under the {OUTER_HARD_TIMEOUT_SECONDS}s outer cap) "
+                f"nearly/fully exhausted (elapsed={scrape_phase_elapsed:.1f}s "
+                f"post-setup, {total_elapsed:.1f}s total incl. setup) before "
+                f"any reviews were collected",
             )
     logger.info("Collected %d reviews", len(final))
     return final
 
 
+def _scrape_sync_product(query: str, queued_at: float) -> List[str]:
+    """Genuinely product-specific counterpart to `_scrape_sync`.
+
+    Deliberately SKIPS `_scrape_maps` entirely. Google Maps only ever has a
+    listing for the business as a whole (e.g. "boAt Lifestyle" the store),
+    never for one SKU ("Airdopes 131") - there is no such thing as a Maps
+    listing for a single product. Running `_scrape_maps` here would just
+    re-collect the exact same business-wide reviews `scrape_google_reviews`
+    already gets for the "General" job, which is the "identical Google
+    comments duplicated across every selected product" problem this
+    function exists to fix. See `_cache_key_for`'s docstring below for the
+    business-level scrape this intentionally does NOT touch.
+
+    Instead this goes straight to the search-snippet chain (Google search
+    -> Bing -> DuckDuckGo), using a query that includes the product name,
+    so the snippets collected are about that specific product. Not
+    cached/shared across products on purpose: every product's query text
+    is different, so every product gets its own independent scrape.
+    """
+    if sys.platform.startswith("win"):
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+    setup_start = time.monotonic()
+    start = queued_at
+
+    try:
+        context = _ensure_context()
+    except Exception:
+        logger.exception("Could not start/obtain a browser context for product query=%r.", query)
+        return []
+
+    raw_results: List[str] = []
+    bot_checked_any = False
+    page = None
+    try:
+        page = context.new_page()
+        page.set_default_timeout(8000)
+
+        setup_elapsed = time.monotonic() - setup_start
+        deadline = start + OUTER_HARD_TIMEOUT_SECONDS - SAFETY_MARGIN_SECONDS
+        remaining_budget = deadline - time.monotonic()
+        logger.info(
+            "Google PRODUCT search: browser/context/page setup took %.1fs; "
+            "%.1fs left for query=%r before the internal deadline.",
+            setup_elapsed, remaining_budget, query,
+        )
+
+        def time_left() -> float:
+            return deadline - time.monotonic()
+
+        if remaining_budget <= MIN_USEFUL_BUDGET_SECONDS:
+            logger.warning(
+                "Google PRODUCT search: only %.1fs left for query=%r after "
+                "a %.1fs setup - not enough time to attempt navigation; "
+                "returning early instead of risking the outer hard timeout.",
+                remaining_budget, query, setup_elapsed,
+            )
+        else:
+            try:
+                search_texts, hit_bot_check = _scrape_search_fallback(page, query, time_left)
+                raw_results.extend(search_texts)
+                bot_checked_any = bot_checked_any or hit_bot_check
+            except Exception:
+                logger.exception("Product search fallback failed for query=%r.", query)
+
+            # See the matching comment in _scrape_sync - same reasoning.
+            if len(raw_results) < min(5, MAX_GOOGLE_REVIEWS) and time_left() > _DDG_RESERVE_SECONDS + 2:
+                try:
+                    raw_results.extend(_scrape_bing_fallback(page, query, time_left))
+                except Exception:
+                    logger.exception("Product Bing fallback failed for query=%r.", query)
+
+            if len(raw_results) < min(5, MAX_GOOGLE_REVIEWS) and time_left() > 3:
+                try:
+                    raw_results.extend(_scrape_ddg_fallback(query, time_left))
+                except Exception:
+                    logger.exception("Product DuckDuckGo fallback failed for query=%r.", query)
+    finally:
+        if page is not None:
+            try:
+                page.close()
+            except Exception:
+                pass
+        if bot_checked_any:
+            logger.warning(
+                "Bot-check triggered for product query=%r; recycling browser context on %s.",
+                query, threading.current_thread().name,
+            )
+            _teardown_thread_browser(reason="bot_detection")
+
+    elapsed = time.monotonic() - start
+    logger.info(
+        "Collected %d raw product candidate(s) for query=%r in %.1fs.",
+        len(raw_results), query, elapsed,
+    )
+
+    cleaned: List[str] = []
+    for raw in raw_results:
+        stripped = _strip_review_boilerplate(raw)
+        if stripped and len(stripped.split()) >= 5 and _looks_like_review(stripped):
+            cleaned.append(stripped)
+
+    before_dedupe = len(cleaned)
+    cleaned = _dedupe(cleaned)
+    final = normalize_comments(cleaned)[:MAX_GOOGLE_REVIEWS]
+    logger.info(
+        "Google product reviews for query=%r: raw=%d duplicates_removed=%d "
+        "final=%d elapsed=%.1fs (cap=%d).",
+        query, before_dedupe, before_dedupe - len(cleaned), len(final),
+        time.monotonic() - start, MAX_GOOGLE_REVIEWS,
+    )
+    return final
+
+
+async def scrape_google_product_reviews(product_data: Dict[str, str]) -> List[str]:
+    """Genuinely product-specific Google signal.
+
+    Unlike `scrape_google_reviews` (Google Maps, business-wide, cached and
+    shared across every product in the run), this searches for
+    "<company name> <product name>" review snippets and is never cached
+    across products - each product gets its own real scrape.
+    """
+    company_name = (product_data or {}).get("company_name", "") or ""
+    product_name = (product_data or {}).get("product_name", "") or ""
+    query = f"{company_name} {product_name}".strip()
+    if not query:
+        logger.info(
+            "scrape_google_product_reviews called with no company/product "
+            "name; returning []."
+        )
+        return []
+
+    queued_at = time.monotonic()
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(_EXECUTOR, _scrape_sync_product, query, queued_at)
+    except Exception:
+        logger.exception("Unhandled error scraping Google product reviews for query=%r.", query)
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Business-level cache + single-flight coalescing.
 #
-# Google Reviews belong to the business, not to an individual product, but
-# app.py schedules one job per selected product (plus one "General" job),
-# each calling scrape_google_reviews with a query like "{company} {product
-# name}". Previously every one of those jobs opened its own Google Maps
-# session — for 5 selected products that's 5 full Playwright scrapes,
-# which is exactly why "Google Review Collection" dominates the runtime in
-# the production log.
+# Google Reviews belong to the business, not to an individual product.
+# CURRENT STATE (verified against app.py this session): app.py's "General"
+# job (one per analysis run) is the only caller of scrape_google_reviews()
+# below - every per-product job instead calls
+# scrape_google_product_reviews() (the search-snippet path, defined above),
+# which never touches Maps or this cache at all. That split is itself the
+# fix for an OLDER bug, kept here as history so it isn't re-litigated: app.py
+# used to schedule one job per selected product PLUS one "General" job, with
+# EVERY one of those jobs calling scrape_google_reviews() with a query like
+# "{company} {product name}" - for 3-5 selected products that was 3-5 full
+# Playwright Maps sessions for what is, by construction, the exact same
+# business-wide review set, which is exactly why "Google Review Collection"
+# used to dominate the runtime in the production log, and why every
+# product's "Google" comments used to look suspiciously identical (see
+# ARCHITECTURE.md's history section - if that symptom ever reappears, this
+# exact bug has regressed).
 #
-# Fix: cache the collected reviews per business (keyed by the company's
-# website, which is identical across every job for one analysis run,
-# unlike company_name which gets a product suffix appended) and, if a
-# scrape for that business is already running when another job asks for
-# it, await that same in-flight scrape instead of starting a second one.
-# The result: one analysis run does at most ONE real Maps scrape no
-# matter how many products were selected, and every job gets the same
-# review set. A later, separate analysis of the same company still gets a
-# fresh scrape once GOOGLE_REVIEW_CACHE_TTL_SECONDS has elapsed.
-#
-# This lives entirely inside this module so app.py's per-product job
-# structure, function names, and call signatures don't need to change.
+# What this cache still protects against, now that the split above exists:
+# it caches the collected reviews per business (keyed by the company's
+# website) and, if a scrape for that business is already running when
+# another call asks for it, awaits that same in-flight scrape instead of
+# starting a second one - defense in depth against scrape_google_reviews()
+# ever being invoked more than once in the same run (e.g. a future caller,
+# a retry path, or a second analysis of the same company started while the
+# first is still running). A later, separate analysis of the same company
+# still gets a fresh scrape once GOOGLE_REVIEW_CACHE_TTL_SECONDS has
+# elapsed.
 # ---------------------------------------------------------------------------
 _review_cache: Dict[str, Tuple[float, List[str]]] = {}
 _inflight_tasks: Dict[str, "asyncio.Task"] = {}
@@ -2371,6 +3278,11 @@ async def scrape_google_reviews(company_data: Dict[str, str]) -> List[str]:
         logger.info("scrape_google_reviews called with no company_name; returning [].")
         return []
 
+    # NOTE: this is a queue timestamp for elapsed-time logging only, not a
+    # working deadline. The real TIME_BUDGET_SECONDS nav+scrape deadline is
+    # computed inside _scrape_sync, after browser/context/page setup
+    # actually finishes - see the fix there for why that matters.
+    queued_at = time.monotonic()
     cache_key = _cache_key_for(company_data)
     now = time.monotonic()
 
@@ -2427,7 +3339,7 @@ async def scrape_google_reviews(company_data: Dict[str, str]) -> List[str]:
     # --- 3) Nobody has scraped this business yet - do the real scrape,
     # and let any jobs that arrive while it's running join in via step 2. ---
     loop = asyncio.get_running_loop()
-    task = loop.run_in_executor(_EXECUTOR, _scrape_sync, query, company_data)
+    task = loop.run_in_executor(_EXECUTOR, _scrape_sync, query, company_data, queued_at)
     _inflight_tasks[cache_key] = task
 
     # Populate the cache from a done-callback rather than from the code
@@ -2450,7 +3362,18 @@ async def scrape_google_reviews(company_data: Dict[str, str]) -> List[str]:
         if exc is not None:
             logger.error("Background Google Reviews scrape for %r failed: %s", key, exc)
             return
-        _review_cache[key] = (time.monotonic(), list(t.result()))
+        outcome = list(t.result())
+        if not outcome:
+            # Zero-review outcomes (TIMEOUT, NAV_FAILURE, BUSINESS_NOT_FOUND,
+            # or a genuine zero-review business) are not cached, so the next
+            # job for this business retries the scrape instead of being
+            # served a stale/empty result for the full cache TTL.
+            logger.info(
+                "Background Google Reviews scrape for business=%r returned "
+                "0 reviews; not caching (will retry on next request).", key,
+            )
+            return
+        _review_cache[key] = (time.monotonic(), outcome)
 
     task.add_done_callback(_on_scrape_done)
 
@@ -2469,4 +3392,4 @@ async def scrape_google_reviews(company_data: Dict[str, str]) -> List[str]:
         logger.exception("Unhandled error scraping Google reviews for query=%r.", query)
         return []
 
-    return result
+    return result
