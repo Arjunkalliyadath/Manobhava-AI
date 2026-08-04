@@ -1,343 +1,123 @@
-# 🌐 Website Product Analyzer
+# Website Product Analyzer
 
-An AI-powered web application that automatically discovers products from a company website, collects customer feedback from multiple online platforms, performs sentiment analysis using **RoBERTa**, and generates an interactive dashboard with downloadable reports.
+A FastAPI-based web application that analyzes a company website, discovers its products, collects customer feedback from multiple online platforms, runs sentiment analysis, and generates an interactive dashboard with downloadable reports.
 
----
+## Overview
 
-# 🚀 Features
+This project helps turn raw product mentions and customer reviews into actionable insights. It supports:
 
-## 🌍 Website Metadata Extraction
+- company and website metadata extraction
+- product discovery from an e-commerce or brand website
+- product selection for focused analysis
+- review collection from Google, Twitter, Instagram, YouTube, Reddit, and website pages
+- sentiment analysis using a RoBERTa-based Hugging Face model
+- summary and report generation for product and brand-level understanding
 
-Automatically extracts:
+## Key Features
 
-- Company Name
-- Logo
-- Website URL
-- Twitter (X)
-- Instagram
-- YouTube
-- Facebook
-- LinkedIn
+- Discover products automatically from a provided website
+- Let users select a small set of products for targeted analysis
+- Collect review data from multiple sources in parallel
+- Clean and deduplicate scraped comments before analysis
+- Generate an interactive dashboard with insights and recommendations
+- Export reports in PDF format for sharing and presentation
 
----
+## Tech Stack
 
-## 📦 Product Discovery
+- Backend: Python, FastAPI
+- Frontend: HTML, CSS, JavaScript, Jinja2 templates
+- Scraping: Playwright, BeautifulSoup4, httpx
+- Data handling: pandas, numpy
+- NLP: transformers, torch, RoBERTa
+- Reporting: reportlab
 
-- Crawls the provided website
-- Automatically discovers available products
-- Supports large e-commerce websites
-- Identifies hundreds of products from a single website
+## Project Structure
 
-Example:
-
-```
-Website
-
-↓
-
-234 Products Found
-```
-
----
-
-## ✅ Product Selection
-
-Instead of analyzing every product, users can:
-
-- Search products
-- Select only the required products
-- Analyze up to **5 selected products**
-
-This significantly reduces execution time while allowing focused analysis.
-
----
-
-## 🌐 Multi-Platform Review Collection
-
-Collects customer reviews from:
-
-- ⭐ Google Reviews
-- 🐦 Twitter (X)
-- 📸 Instagram
-- ▶️ YouTube
-
-The system is fault tolerant and continues execution even if one platform times out or returns no data.
-
----
-
-## 🤖 AI Sentiment Analysis
-
-Uses the Hugging Face model
-
-```
-cardiffnlp/twitter-roberta-base-sentiment-latest
+```text
+.
+├── app.py                  # FastAPI app and main analysis pipeline
+├── config.py               # Tunable scraper and analysis settings
+├── company_discovery.py    # Website/company metadata extraction
+├── product_discovery.py    # Product discovery logic
+├── product_intelligence.py # Product-level intelligence generation
+├── aspect_intelligence.py  # Aspect-level analysis logic
+├── sentiment.py            # Sentiment analysis pipeline
+├── utils.py                # Shared helper utilities
+├── url_utils.py            # URL and company-name utilities
+├── scrapers/               # Platform-specific scraper modules
+├── templates/              # HTML templates for the UI
+├── static/                 # Static assets for the web app
+├── downloads/              # Generated reports and exports
+└── requirements.txt
 ```
 
-Features:
+## Setup Instructions
 
-- Positive / Neutral / Negative classification
-- Batch inference
-- Duplicate removal
-- Text preprocessing
-- Keyword-based fallback
-
----
-
-## 📊 Interactive Dashboard
-
-Provides:
-
-- Brand Score
-- Sentiment Distribution
-- Product-wise Analysis
-- Platform-wise Analysis
-- Executive Summary
-- Key Insights
-- Recommendations
-- Most Discussed Product
-- Positive & Negative Highlights
-
----
-
-## 📄 Export Options
-
-Generate downloadable reports in:
-
-- PDF
-
----
-
-# 🏗 Architecture
-
-```
-Website URL
-      │
-      ▼
-Website Metadata Extraction
-      │
-      ▼
-Product Discovery
-      │
-      ▼
-User Product Selection
-      │
-      ▼
-Review Collection
-      │
-      ├── Google Reviews
-      ├── Twitter
-      ├── Instagram
-      └── YouTube
-      │
-      ▼
-Data Cleaning
-      │
-      ▼
-RoBERTa Sentiment Analysis
-      │
-      ▼
-Analytics Engine
-      │
-      ▼
-Dashboard
-      │
-      ▼
-CSV / Excel / JSON / PDF
-```
-
----
-
-# 🔄 Workflow
-
-```
-User enters Website URL
-
-        │
-
-        ▼
-
-Extract Website Metadata
-
-        │
-
-        ▼
-
-Discover Products
-
-        │
-
-        ▼
-
-Select Products
-
-        │
-
-        ▼
-
-Collect Reviews
-
-        │
-
-        ▼
-
-Clean & Preprocess Data
-
-        │
-
-        ▼
-
-RoBERTa Sentiment Analysis
-
-        │
-
-        ▼
-
-Generate Dashboard
-
-        │
-
-        ▼
-
-Download Reports
-```
-
----
-
-# ⚙ Installation
-
-Clone the repository
+### 1. Clone the repository
 
 ```bash
 git clone https://github.com/Arjunkalliyadath/Website-Product-Analyzer.git
-```
-
-Navigate to the project
-
-```bash
 cd Website-Product-Analyzer
 ```
 
-Create a virtual environment
+### 2. Create and activate a virtual environment
+
+#### Windows
 
 ```bash
-python -m venv venv
+python -m venv .venv
+.venv\Scripts\activate
 ```
 
-Activate the virtual environment
-
-### Windows
+#### macOS / Linux
 
 ```bash
-venv\Scripts\activate
+python -m venv .venv
+source .venv/bin/activate
 ```
 
-### Linux / macOS
-
-```bash
-source venv/bin/activate
-```
-
-Install dependencies
+### 3. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Run the application
+### 4. Install Playwright browser dependencies
+
+```bash
+playwright install chromium
+```
+
+### 5. Run the application
 
 ```bash
 python -m uvicorn app:app --reload
 ```
 
-Open your browser
+Then open:
 
-```
+```text
 http://127.0.0.1:8000
 ```
 
----
+> Note: The first run may download the sentiment model from Hugging Face, so it may take a few minutes to become fully responsive.
 
-# 🛠 Tech Stack
+## Usage Flow
 
-### Backend
+1. Open the app in your browser.
+2. Enter a company website or brand URL.
+3. Review the discovered products.
+4. Select the products to analyze.
+5. Wait for the scrapers and sentiment pipeline to complete.
+6. View the dashboard and download the generated report.
 
-- Python
-- FastAPI
+## Notes
 
-### Frontend
+- The app is optimized for fast analysis and may limit the amount of data collected per platform to keep runs responsive.
+- Some websites may block automated browsing, which can affect the amount of data returned by the scrapers.
 
-- HTML
-- CSS
-- JavaScript
-- Jinja2
+## Author
 
-### Machine Learning
-
-- Hugging Face Transformers
-- RoBERTa
-- PyTorch
-
-### Data Processing
-
-- Pandas
-- NumPy
-
-### Web Scraping
-
-- Playwright
-- BeautifulSoup
-- HTTPX
-
-### Reports
-
-- ReportLab
-- CSV
-- Excel
-- JSON
-
----
-
-# 📂 Project Structure
-
-```
-Website-Product-Analyzer/
-
-│
-├── app.py
-├── config.py
-├── company_discovery.py
-├── product_discovery.py
-├── sentiment.py
-├── utils.py
-│
-├── scrapers/
-│   ├── google_scraper.py
-│   ├── twitter_scraper.py
-│   ├── instagram_scraper.py
-│   └── youtube_scraper.py
-│
-├── templates/
-│   ├── index.html
-│   ├── dashboard.html
-│   └── select_products.html
-│
-├── static/
-├── downloads/
-├── requirements.txt
-└── README.md
-```
-
----
-
-
-# 👨‍💻 Author
-
-**Arjun K**
-
-AI/ML Engineer • Data Science Enthusiast
+Arjun K
 
 GitHub: https://github.com/Arjunkalliyadath
-
----
-
-⭐ If you found this project useful, consider giving it a star on GitHub.
