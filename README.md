@@ -1,11 +1,8 @@
-
-
-
 # Website Product Analyzer
 
 A FastAPI-based web application that analyzes a company website, discovers its products, collects customer feedback from multiple online platforms, runs sentiment analysis, and generates an interactive dashboard with downloadable reports.
 
-https://github.com/user-attachments/assets/c16113ab-770c-40a4-9452-27bc51c5f56b
+https://github.com/user-attachments/assets/5a446b86-50bf-4410-a17f-a2a6eede409c
 
 ## Overview
 
