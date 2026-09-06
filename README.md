@@ -1,4 +1,4 @@
-# Website Product Analyzer
+# Manobhava - AI
 
 A FastAPI-based web application that analyzes a company website, discovers its products, collects customer feedback from multiple online platforms, runs sentiment analysis, and generates an interactive dashboard with downloadable reports.
 
